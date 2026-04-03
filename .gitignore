@@ -1,0 +1,54 @@
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors
+.vscode/
+.idea/
+
+# Environment files
+.env
+.env.*
+
+# Logs
+*.log
+
+# Training artifacts
+checkpoints/
+*/checkpoints/
+weights/
+*/weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Dataset and raw media
+raw_videos/
+*.MOV
+*.mp4
+*.avi
+*.mkv
+1_django_collection
+2_face_dataset
+
+# Local databases and exports
+*.db
+*.sqlite3
+*.csv
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
