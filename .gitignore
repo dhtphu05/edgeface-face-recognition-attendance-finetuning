@@ -40,6 +40,13 @@ raw_videos/
 *.mp4
 *.avi
 *.mkv
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.tif
+*.tiff
 1_django_collection
 2_face_dataset
 

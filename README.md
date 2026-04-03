@@ -13,9 +13,40 @@ cd Attendance_Workspace/3_edgeface_training
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python scripts/train_phase3.py
-python scripts/prune_phase4.py
-python scripts/finetune_phase5.py
+python scripts/audit_face_dataset.py --dataset-root ../2_face_dataset --report-json checkpoints/dataset_audit.json
+python scripts/create_heldout_split.py --source-root ../2_face_dataset --output-root ../2_face_dataset_split
+python scripts/train_phase3.py --dataset-root ../2_face_dataset_split --width-preset widened --rank-ratio 0.7 --kd-alpha 0 --skip-student-bootstrap --skip-teacher-bootstrap --epochs 10 --output-prefix phase3_smoke_nokd
+python scripts/train_phase3.py --dataset-root ../2_face_dataset_split --width-preset widened --rank-ratio 0.7 --kd-alpha 0 --skip-student-bootstrap --skip-teacher-bootstrap --epochs 40 --output-prefix phase3_baseline_nokd
+python scripts/evaluate_paper_metrics.py --checkpoint checkpoints/phase3_baseline_nokd_best.pth --dataset-root ../2_face_dataset_split --num-workers 0 --report-json checkpoints/phase3_baseline_nokd_eval.json
+python scripts/train_phase3.py --dataset-root ../2_face_dataset_split --width-preset widened --rank-ratio 0.7 --kd-alpha 100 --skip-student-bootstrap --skip-teacher-bootstrap --teacher-pretrained-imagenet --epochs 40 --output-prefix phase3_kd100_imagenet
+python scripts/prune_phase4.py --input checkpoints/phase3_baseline_nokd_best.pth --output checkpoints/phase4_pruned_model.pth --prune-ratio 0.01
+python scripts/finetune_phase5.py --dataset-root ../2_face_dataset_split
+```
+
+## Video nhóm
+
+Để tách video nhóm thành các track review thủ công trước khi gán nhãn:
+
+```bash
+pip install insightface onnxruntime opencv-python
+python scripts/import_group_video_to_tracks.py \
+  ../raw_videos/group_video.mp4 \
+  ../group_tracks \
+  --frame-skip 3 \
+  --min-face-size 60 \
+  --min-track-length 5
+```
+
+Đầu ra sẽ có dạng:
+
+```text
+group_tracks/<video_stem>/
+  manifest.json
+  summary.txt
+  tracks/
+    track_001/
+    track_002/
+    ...
 ```
 
 ## Tài liệu vận hành

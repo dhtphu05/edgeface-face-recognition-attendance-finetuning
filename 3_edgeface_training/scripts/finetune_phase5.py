@@ -16,15 +16,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from core_losses import AdaFaceLoss
 from dataloaders import build_dataloaders
 from models import EdgeFaceXXS
+from models.edgeface_xxs import build_edgeface_config_from_metadata
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 5: finetune pruned model.")
-    parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        default=WORKSPACE_ROOT / "2_face_dataset",
-    )
+    parser.add_argument("--dataset-root", type=Path, default=WORKSPACE_ROOT / "2_face_dataset")
     parser.add_argument(
         "--input",
         type=Path,
@@ -38,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--num-workers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -47,18 +45,23 @@ def main() -> None:
         "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     )
     checkpoint = torch.load(args.input, map_location="cpu")
-    train_loader, _, class_names = build_dataloaders(args.dataset_root, batch_size=args.batch_size)
+    train_loader, _, class_names = build_dataloaders(
+        args.dataset_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
 
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        embedding_dim = checkpoint.get("embedding_dim", 256)
-        state_dict = checkpoint["model_state_dict"]
-    else:
-        embedding_dim = 256
-        state_dict = checkpoint
+    state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+    config = build_edgeface_config_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
 
-    model = EdgeFaceXXS(embedding_dim=embedding_dim).to(device)
+    model = EdgeFaceXXS(
+        embedding_dim=config.embedding_dim,
+        width_preset=config.width_preset,
+        stage_channels=config.stage_channels,
+        rank_ratio=config.rank_ratio,
+    ).to(device)
     model.load_state_dict(state_dict)
-    criterion = AdaFaceLoss(embedding_size=embedding_dim, num_classes=len(class_names)).to(device)
+    criterion = AdaFaceLoss(embedding_size=config.embedding_dim, num_classes=len(class_names)).to(device)
     optimizer = AdamW(list(model.parameters()) + list(criterion.parameters()), lr=args.lr)
 
     for epoch in range(args.epochs):
@@ -75,16 +78,16 @@ def main() -> None:
             progress.set_postfix(loss=f"{loss.item():.4f}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    metadata = checkpoint if isinstance(checkpoint, dict) else {}
-    torch.save(
-        {
-            **metadata,
-            "embedding_dim": embedding_dim,
-            "model_state_dict": model.state_dict(),
-            "finetuned_epochs": args.epochs,
-        },
-        args.output,
-    )
+    payload = {
+        **(checkpoint if isinstance(checkpoint, dict) else {}),
+        "model_state_dict": model.state_dict(),
+        "embedding_dim": config.embedding_dim,
+        "width_preset": config.width_preset,
+        "stage_channels": list(config.resolved_stage_channels()),
+        "rank_ratio": config.rank_ratio,
+        "finetuned_epochs": args.epochs,
+    }
+    torch.save(payload, args.output)
     print(f"Saved finetuned model to {args.output}")
 
 

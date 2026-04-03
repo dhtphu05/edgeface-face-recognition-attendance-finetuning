@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 class LoRaLinConv1x1(nn.Module):
     """
     Module phân rã hạng thấp (Low-Rank) tối ưu riêng cho lớp Pointwise Conv (1x1).
@@ -8,9 +9,12 @@ class LoRaLinConv1x1(nn.Module):
     """
     def __init__(self, in_channels, out_channels, stride=1, rank_ratio=0.6):
         super(LoRaLinConv1x1, self).__init__()
-        
+        if rank_ratio <= 0:
+            raise ValueError("rank_ratio must be greater than 0.")
+
         # Tính toán hạng (rank) trung gian r
         self.rank = max(2, int(min(in_channels, out_channels) * rank_ratio))
+        self.rank_ratio = rank_ratio
 
         # Phân rã Conv 1x1 thành lớp Nén (Compress) và Giải nén (Expand)
         self.compress = nn.Conv2d(in_channels, self.rank, kernel_size=1, stride=stride, bias=False)

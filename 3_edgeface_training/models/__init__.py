@@ -1,3 +1,2 @@
-from .edgeface_xxs import EdgeFaceXXS
+from .edgeface_xxs import MODEL_PRESETS, EdgeFaceXXS, build_edgeface_config, build_edgeface_config_from_metadata
 from .resnet101_teacher import ResNet101Teacher
-
