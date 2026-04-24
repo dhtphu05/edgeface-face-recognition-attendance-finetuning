@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch import amp
 from torch.utils.data import DataLoader, Dataset, Subset
-from torchvision import datasets, transforms
+from torchvision import transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PROJECT_ROOT.parent
@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core_losses.adaface_loss import AdaFaceLoss
 from core_losses.kd_loss import EmbeddingKDLoss
-from dataloaders.dataset import resolve_dataset_split_dirs
+from dataloaders.dataset import HierarchicalImageFolder, resolve_dataset_split_dirs
 from models.edgeface_xxs import MODEL_PRESETS, EdgeFaceXXS
 from models.resnet101_teacher import ResNet101Teacher
 
@@ -253,14 +253,19 @@ def build_datasets(
     if "train" in split_dirs:
         train_root = split_dirs["train"]
         val_root = split_dirs.get("val", split_dirs["train"])
-        train_dataset_full = datasets.ImageFolder(root=str(train_root), transform=train_transform)
-        val_dataset_full = datasets.ImageFolder(root=str(val_root), transform=val_transform)
-        if train_dataset_full.classes != val_dataset_full.classes:
+        train_dataset_full = HierarchicalImageFolder(root=train_root, transform=train_transform)
+        train_class_names = list(train_dataset_full.classes)
+        val_dataset_full = HierarchicalImageFolder(
+            root=val_root,
+            transform=val_transform,
+            class_names=train_class_names if val_root != train_root else None,
+        )
+        if val_root != train_root and train_class_names != val_dataset_full.classes:
             raise ValueError(
                 "Train/val class mapping mismatch. "
-                f"train_classes={train_dataset_full.classes} val_classes={val_dataset_full.classes}"
+                f"train_classes={train_class_names} val_classes={val_dataset_full.classes}"
             )
-        class_names = list(train_dataset_full.classes)
+        class_names = list(train_class_names)
         if val_root == train_root:
             total_samples = len(train_dataset_full)
             val_size = max(1, int(total_samples * val_split))
@@ -279,8 +284,8 @@ def build_datasets(
             val_dataset = val_dataset_full
             dataset_structure = "structured_train_val"
     else:
-        train_dataset_full = datasets.ImageFolder(root=str(dataset_root), transform=train_transform)
-        val_dataset_full = datasets.ImageFolder(root=str(dataset_root), transform=val_transform)
+        train_dataset_full = HierarchicalImageFolder(root=dataset_root, transform=train_transform)
+        val_dataset_full = HierarchicalImageFolder(root=dataset_root, transform=val_transform)
         class_names = list(train_dataset_full.classes)
         total_samples = len(train_dataset_full)
         val_size = max(1, int(total_samples * val_split))

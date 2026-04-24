@@ -1,0 +1,30 @@
+source_video: /Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/raw_videos/IMG_9401.MOV
+gallery_dir: /Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Face-Aligner-For-Dataset/dataset
+total_frames_read: 619
+sampled_frames: 207
+total_detections_kept: 148
+total_tracks_created: 16
+total_tracks_retired: 16
+final_tracks_kept: 6
+dropped_short_tracks: 10
+auto_matched_tracks: 0
+
+Kept tracks:
+- track_001: images=29 frames=241->325 suggested=102250326 score=-0.0144 status=needs_review
+- track_002: images=32 frames=265->358 suggested=102250326 score=0.0445 status=needs_review
+- track_008: images=14 frames=373->412 suggested=102250326 score=0.3343 status=needs_review
+- track_011: images=20 frames=382->439 suggested=102250326 score=0.0614 status=needs_review
+- track_012: images=28 frames=382->472 suggested=102250326 score=0.0858 status=needs_review
+- track_016: images=10 frames=550->577 suggested=102250326 score=-0.0063 status=needs_review
+
+Dropped tracks:
+- track_003: status=dropped_short_track images=3
+- track_004: status=dropped_short_track images=1
+- track_005: status=dropped_short_track images=1
+- track_006: status=dropped_short_track images=1
+- track_007: status=dropped_short_track images=1
+- track_009: status=dropped_short_track images=2
+- track_010: status=dropped_short_track images=2
+- track_013: status=dropped_short_track images=1
+- track_014: status=dropped_short_track images=2
+- track_015: status=dropped_short_track images=1

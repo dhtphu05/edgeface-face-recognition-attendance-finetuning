@@ -34,7 +34,8 @@ python scripts/import_group_video_to_tracks.py \
   ../group_tracks \
   --frame-skip 3 \
   --min-face-size 60 \
-  --min-track-length 5
+  --min-track-length 5 \
+  --gallery-dir ../2_face_dataset
 ```
 
 Đầu ra sẽ có dạng:
@@ -49,10 +50,33 @@ group_tracks/<video_stem>/
     ...
 ```
 
+Khi dùng `--gallery-dir`, `manifest.json` và `summary.txt` sẽ có thêm:
+
+- `suggested_student_id`
+- `similarity_score`
+- `second_best_student_id`
+- `review_status`
+
+Các track có `review_status=auto_matched` là gợi ý mạnh, nhưng vẫn nên review trước khi nhập vào dataset thật.
+
 ## Tài liệu vận hành
 
 - Quy trình hybrid training, best practices thu thập dữ liệu từ video, và checklist tối ưu hiệu suất:
   [docs/TRAINING_BEST_PRACTICES.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/TRAINING_BEST_PRACTICES.md)
+- Hướng dẫn setup training trên Google Colab với dataset đã nằm trên Google Drive:
+  [docs/COLAB_TRAINING_SETUP.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/COLAB_TRAINING_SETUP.md)
+- Chiến lược tốt nhất hiện tại cho bài toán này khi có public face dataset lớn:
+  [docs/PUBLIC_PRETRAINING_STRATEGY.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/PUBLIC_PRETRAINING_STRATEGY.md)
+- Bảng đối chiếu trạng thái thực tế của pipeline `8.2 -> 8.6`:
+  [docs/PIPELINE_STATUS.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/PIPELINE_STATUS.md)
+- Báo cáo học thuật tiến độ theo format nghiên cứu:
+  [docs/ACADEMIC_PROGRESS_REPORT.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/ACADEMIC_PROGRESS_REPORT.md)
+
+## Colab
+
+Notebook Colab cho public pretraining:
+
+- [3_edgeface_training/notebooks/colab_public_pretrain.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_public_pretrain.ipynb)
 
 ## Ghi chú
 

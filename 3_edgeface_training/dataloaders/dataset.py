@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import torch
@@ -20,9 +20,44 @@ class Sample:
 
 
 def _discover_class_names(root_dir: Path) -> list[str]:
-    if not root_dir.exists():
-        raise FileNotFoundError(f"Dataset directory does not exist: {root_dir}")
-    return sorted([path.name for path in root_dir.iterdir() if path.is_dir()])
+    return sorted(discover_class_dir_map(root_dir))
+
+
+def _contains_images(directory: Path) -> bool:
+    for child in directory.iterdir():
+        if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS:
+            return True
+    return False
+
+
+def discover_class_dir_map(root_dir: str | Path) -> dict[str, Path]:
+    root = Path(root_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+
+    class_dir_map: dict[str, Path] = {}
+
+    def visit(directory: Path) -> None:
+        if _contains_images(directory):
+            class_name = directory.name
+            existing = class_dir_map.get(class_name)
+            if existing is not None and existing != directory:
+                raise ValueError(
+                    f"Duplicate class directory name discovered under {root}: "
+                    f"{class_name} -> {existing} and {directory}"
+                )
+            class_dir_map[class_name] = directory
+            return
+
+        for child in sorted(directory.iterdir()):
+            if child.is_dir():
+                visit(child)
+
+    for child in sorted(root.iterdir()):
+        if child.is_dir():
+            visit(child)
+
+    return dict(sorted(class_dir_map.items()))
 
 
 def resolve_dataset_split_dirs(root_dir: str | Path) -> dict[str, Path]:
@@ -78,6 +113,59 @@ class FaceFolderDataset(Dataset):
         image_np = (image_np - 0.5) / 0.5
         image_np = np.transpose(image_np, (2, 0, 1))
         return torch.from_numpy(image_np), sample.label
+
+
+class HierarchicalImageFolder(Dataset):
+    def __init__(
+        self,
+        root: str | Path,
+        transform: Callable | None = None,
+        class_names: Iterable[str] | None = None,
+    ) -> None:
+        self.root = Path(root)
+        self.transform = transform
+        full_class_dir_map = discover_class_dir_map(self.root)
+        if class_names is None:
+            self.classes = sorted(full_class_dir_map)
+        else:
+            self.classes = list(class_names)
+        self.class_to_idx = {class_name: index for index, class_name in enumerate(self.classes)}
+        self.class_dir_map = {
+            class_name: full_class_dir_map[class_name]
+            for class_name in self.classes
+            if class_name in full_class_dir_map
+        }
+        self.samples: list[tuple[str, int]] = []
+        self.targets: list[int] = []
+
+        for class_name in self.classes:
+            class_dir = self.class_dir_map.get(class_name)
+            if class_dir is None:
+                continue
+            label = self.class_to_idx[class_name]
+            for image_path in sorted(class_dir.iterdir()):
+                if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS:
+                    self.samples.append((str(image_path), label))
+                    self.targets.append(label)
+
+        if not self.samples:
+            raise ValueError(f"No images found in dataset directory: {self.root}")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        image_path, label = self.samples[index]
+        image = Image.open(image_path).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        else:
+            image = image.resize((112, 112))
+            image_np = np.asarray(image, dtype=np.float32) / 255.0
+            image_np = (image_np - 0.5) / 0.5
+            image_np = np.transpose(image_np, (2, 0, 1))
+            image = torch.from_numpy(image_np)
+        return image, label
 
 
 def build_dataloaders(
