@@ -21,9 +21,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core_losses.adaface_loss import AdaFaceLoss
+from core_losses.adadistill_loss import AdaDistillLoss, AdaDistillStats
 from core_losses.kd_loss import EmbeddingKDLoss
 from dataloaders.dataset import HierarchicalImageFolder, resolve_dataset_split_dirs
 from models.edgeface_xxs import MODEL_PRESETS, EdgeFaceXXS
+from models.iresnet_adaface_teacher import IResNet101AdaFaceTeacher
 from models.resnet101_teacher import ResNet101Teacher
 
 
@@ -41,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--kd-alpha", type=float, default=250.0)
+    parser.add_argument(
+        "--kd-mode",
+        choices=["none", "embedding_mse", "adadistill"],
+        default="embedding_mse",
+        help="KD strategy. Use 'none' or kd_alpha=0 to preserve AdaFace-only training.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--width-preset", choices=sorted(MODEL_PRESETS), default="widened")
     parser.add_argument(
@@ -55,6 +63,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dim", type=int, default=512)
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--max-classes",
+        type=int,
+        default=None,
+        help="Restrict dataset loading to the first N sorted classes. Useful for subset-first AdaDistill rollouts.",
+    )
+    parser.add_argument(
+        "--max-samples-per-class",
+        type=int,
+        default=None,
+        help="Cap the number of samples per class before train/val splitting.",
+    )
     parser.add_argument(
         "--max-train-batches-per-epoch",
         type=int,
@@ -83,6 +103,30 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=PROJECT_ROOT / "weights" / "resnet101_adaface.pt",
         help="Teacher checkpoint weights.",
+    )
+    parser.add_argument(
+        "--teacher-backbone",
+        choices=["resnet101_imagenet", "ir101_adaface"],
+        default="resnet101_imagenet",
+        help="Teacher architecture. AdaDistill faithful branch should use ir101_adaface.",
+    )
+    parser.add_argument(
+        "--teacher-centers-path",
+        type=Path,
+        default=None,
+        help="Precomputed teacher class centers required by kd-mode=adadistill.",
+    )
+    parser.add_argument(
+        "--adadistill-weight",
+        type=float,
+        default=0.5,
+        help="Weight applied to the AdaDistill KD term.",
+    )
+    parser.add_argument(
+        "--teacher-logit-scale",
+        type=float,
+        default=64.0,
+        help="Scale used when computing teacher-center logits in AdaDistill mode.",
     )
     parser.add_argument(
         "--skip-student-bootstrap",
@@ -239,10 +283,35 @@ def dataset_label_counts(dataset: Dataset) -> dict[str, int]:
     return counts
 
 
+def maybe_limit_hierarchical_dataset(
+    dataset: HierarchicalImageFolder,
+    *,
+    max_samples_per_class: int | None,
+) -> HierarchicalImageFolder:
+    if max_samples_per_class is None:
+        return dataset
+    filtered_samples: list[tuple[str, int]] = []
+    filtered_targets: list[int] = []
+    per_class_counts = {index: 0 for index in range(len(dataset.classes))}
+    for image_path, label in dataset.samples:
+        if per_class_counts[label] >= max_samples_per_class:
+            continue
+        filtered_samples.append((image_path, label))
+        filtered_targets.append(label)
+        per_class_counts[label] += 1
+    dataset.samples = filtered_samples
+    dataset.targets = filtered_targets
+    if not dataset.samples:
+        raise ValueError("No samples remain after applying max_samples_per_class.")
+    return dataset
+
+
 def build_datasets(
     dataset_root: Path,
     val_split: float,
     seed: int,
+    max_classes: int | None = None,
+    max_samples_per_class: int | None = None,
 ) -> tuple[Dataset, Dataset, list[str], dict[str, Any]]:
     split_dirs = resolve_dataset_split_dirs(dataset_root)
     dataset_structure = "structured" if "train" in split_dirs else "flat"
@@ -267,10 +336,31 @@ def build_datasets(
         val_root = split_dirs.get("val", split_dirs["train"])
         train_dataset_full = HierarchicalImageFolder(root=train_root, transform=train_transform)
         train_class_names = list(train_dataset_full.classes)
+        if max_classes is not None:
+            train_class_names = train_class_names[:max_classes]
+            train_dataset_full = HierarchicalImageFolder(
+                root=train_root,
+                transform=train_transform,
+                class_names=train_class_names,
+            )
+        train_dataset_full = maybe_limit_hierarchical_dataset(
+            train_dataset_full,
+            max_samples_per_class=max_samples_per_class,
+        )
         val_dataset_full = HierarchicalImageFolder(
             root=val_root,
             transform=val_transform,
             class_names=train_class_names if val_root != train_root else None,
+        )
+        if val_root == train_root and max_classes is not None:
+            val_dataset_full = HierarchicalImageFolder(
+                root=val_root,
+                transform=val_transform,
+                class_names=train_class_names,
+            )
+        val_dataset_full = maybe_limit_hierarchical_dataset(
+            val_dataset_full,
+            max_samples_per_class=max_samples_per_class,
         )
         if val_root != train_root and train_class_names != val_dataset_full.classes:
             raise ValueError(
@@ -297,7 +387,27 @@ def build_datasets(
             dataset_structure = "structured_train_val"
     else:
         train_dataset_full = HierarchicalImageFolder(root=dataset_root, transform=train_transform)
-        val_dataset_full = HierarchicalImageFolder(root=dataset_root, transform=val_transform)
+        class_names = list(train_dataset_full.classes)
+        if max_classes is not None:
+            class_names = class_names[:max_classes]
+            train_dataset_full = HierarchicalImageFolder(
+                root=dataset_root,
+                transform=train_transform,
+                class_names=class_names,
+            )
+        train_dataset_full = maybe_limit_hierarchical_dataset(
+            train_dataset_full,
+            max_samples_per_class=max_samples_per_class,
+        )
+        val_dataset_full = HierarchicalImageFolder(
+            root=dataset_root,
+            transform=val_transform,
+            class_names=class_names if max_classes is not None else None,
+        )
+        val_dataset_full = maybe_limit_hierarchical_dataset(
+            val_dataset_full,
+            max_samples_per_class=max_samples_per_class,
+        )
         class_names = list(train_dataset_full.classes)
         total_samples = len(train_dataset_full)
         val_size = max(1, int(total_samples * val_split))
@@ -321,6 +431,8 @@ def build_datasets(
         "class_mapping_matches": train_class_names == val_class_names,
         "train_class_counts": dataset_label_counts(train_dataset),
         "val_class_counts": dataset_label_counts(val_dataset),
+        "max_classes": max_classes,
+        "max_samples_per_class": max_samples_per_class,
     }
     return train_dataset, val_dataset, class_names, diagnostics
 
@@ -341,12 +453,47 @@ def checkpoint_payload(
         "model_state_dict": model.state_dict(),
         "val_accuracy": val_accuracy,
         "kd_alpha": args.kd_alpha,
+        "kd_mode": args.kd_mode,
         "dataset_root": str(args.dataset_root),
         "seed": args.seed,
         "run_diagnostics": run_diagnostics,
     }
     payload.update(model.get_config().to_metadata())
     return payload
+
+
+def load_teacher_center_cache(
+    center_path: Path,
+    class_names: list[str],
+    device: torch.device,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    if not center_path.exists():
+        raise FileNotFoundError(f"Teacher centers cache not found: {center_path}")
+    payload = torch.load(center_path, map_location="cpu")
+    cache_class_names = list(payload["class_names"])
+    if cache_class_names != class_names:
+        raise ValueError(
+            "Teacher center class mapping mismatch. "
+            f"dataset_classes={class_names[:5]} cache_classes={cache_class_names[:5]}"
+        )
+    centers = payload["centers"].to(device)
+    if centers.ndim != 2:
+        raise ValueError(f"Teacher centers tensor must be 2D, got shape={tuple(centers.shape)}")
+    diagnostics = {
+        "path": str(center_path),
+        "class_count": len(cache_class_names),
+        "embedding_dim": int(payload["embedding_dim"]),
+        "teacher_weights": payload.get("teacher_weights"),
+    }
+    return centers, diagnostics
+
+
+def resolve_kd_enabled(args: argparse.Namespace) -> bool:
+    if args.kd_mode == "none":
+        return False
+    if args.kd_mode == "embedding_mse":
+        return args.kd_alpha > 0
+    return True
 
 
 def main() -> None:
@@ -357,13 +504,27 @@ def main() -> None:
 
     if args.kd_alpha < 0:
         raise ValueError("kd_alpha must be >= 0.")
+    if args.adadistill_weight < 0:
+        raise ValueError("adadistill_weight must be >= 0.")
     if args.max_missing_ratio < 0 or args.max_unexpected_ratio < 0:
         raise ValueError("Bootstrap mismatch ratios must be >= 0.")
     if args.max_train_batches_per_epoch is not None and args.max_train_batches_per_epoch <= 0:
         raise ValueError("max_train_batches_per_epoch must be > 0 when provided.")
     if args.max_val_batches is not None and args.max_val_batches <= 0:
         raise ValueError("max_val_batches must be > 0 when provided.")
-    if args.kd_alpha > 0 and args.skip_teacher_bootstrap and not args.teacher_pretrained_imagenet:
+    if args.kd_mode == "adadistill":
+        if args.teacher_backbone != "ir101_adaface":
+            raise ValueError("kd-mode=adadistill requires --teacher-backbone ir101_adaface.")
+        if args.teacher_pretrained_imagenet:
+            raise ValueError("AdaDistill faithful branch cannot use --teacher-pretrained-imagenet.")
+        if args.teacher_centers_path is None:
+            raise ValueError("kd-mode=adadistill requires --teacher-centers-path.")
+    if (
+        args.kd_mode == "embedding_mse"
+        and args.kd_alpha > 0
+        and args.skip_teacher_bootstrap
+        and not args.teacher_pretrained_imagenet
+    ):
         raise ValueError(
             "KD requires a compatible teacher. Use --teacher-pretrained-imagenet or do not skip teacher bootstrap."
         )
@@ -374,6 +535,8 @@ def main() -> None:
         dataset_root=args.dataset_root,
         val_split=args.val_split,
         seed=args.seed,
+        max_classes=args.max_classes,
+        max_samples_per_class=args.max_samples_per_class,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -398,16 +561,17 @@ def main() -> None:
     )
     student_param_count = sum(parameter.numel() for parameter in student_model.parameters())
 
-    kd_enabled = args.kd_alpha > 0
+    kd_enabled = resolve_kd_enabled(args)
     teacher_mode = "disabled"
-    teacher_model: ResNet101Teacher | None = None
+    teacher_model: torch.nn.Module | None = None
+    teacher_centers: torch.Tensor | None = None
     bootstrap_reports: dict[str, Any] = {
         "student": {
             "enabled": not args.skip_student_bootstrap,
             "path": str(args.student_weights),
         },
         "teacher": {
-            "enabled": kd_enabled and not args.skip_teacher_bootstrap and not args.teacher_pretrained_imagenet,
+            "enabled": kd_enabled and args.kd_mode == "embedding_mse" and not args.skip_teacher_bootstrap and not args.teacher_pretrained_imagenet,
             "path": str(args.teacher_weights),
         },
     }
@@ -425,11 +589,14 @@ def main() -> None:
         print("ℹ️ Student bootstrap: disabled by flag.")
         bootstrap_reports["student"] = {"enabled": False, "reason": "skip_student_bootstrap"}
 
-    if kd_enabled:
-        teacher_model = ResNet101Teacher(
-            embedding_size=args.embedding_dim,
-            pretrained=args.teacher_pretrained_imagenet,
-        )
+    if kd_enabled and args.kd_mode == "embedding_mse":
+        if args.teacher_backbone == "ir101_adaface":
+            teacher_model = IResNet101AdaFaceTeacher(embedding_size=args.embedding_dim)
+        else:
+            teacher_model = ResNet101Teacher(
+                embedding_size=args.embedding_dim,
+                pretrained=args.teacher_pretrained_imagenet,
+            )
         if args.teacher_pretrained_imagenet:
             teacher_mode = "imagenet_pretrained"
             bootstrap_reports["teacher"] = {
@@ -438,7 +605,7 @@ def main() -> None:
             }
             print("ℹ️ Teacher mode: torchvision ImageNet pretrained.")
         else:
-            teacher_mode = "checkpoint_bootstrap"
+            teacher_mode = f"{args.teacher_backbone}_checkpoint_bootstrap"
             teacher_model, bootstrap_reports["teacher"] = maybe_load_bootstrap_weights(
                 model=teacher_model,
                 weight_path=args.teacher_weights,
@@ -451,9 +618,18 @@ def main() -> None:
         teacher_model.eval()
         for parameter in teacher_model.parameters():
             parameter.requires_grad = False
+    elif kd_enabled and args.kd_mode == "adadistill":
+        teacher_mode = "ir101_global_centers"
+        teacher_centers, center_report = load_teacher_center_cache(args.teacher_centers_path, class_names, device)
+        bootstrap_reports["teacher"] = {
+            "enabled": False,
+            "reason": "teacher_centers_cache",
+            **center_report,
+        }
     else:
-        print("ℹ️ KD: disabled because kd_alpha=0.")
-        bootstrap_reports["teacher"] = {"enabled": False, "reason": "kd_disabled"}
+        reason = "kd_disabled" if args.kd_mode != "none" else "kd_mode_none"
+        print("ℹ️ KD: disabled.")
+        bootstrap_reports["teacher"] = {"enabled": False, "reason": reason}
 
     student_model = student_model.to(device)
 
@@ -463,12 +639,19 @@ def main() -> None:
         "student_bootstrap": bootstrap_reports["student"],
         "teacher_bootstrap": bootstrap_reports["teacher"],
         "kd_enabled": kd_enabled,
+        "kd_mode": args.kd_mode,
         "kd_alpha": args.kd_alpha,
+        "teacher_backbone": args.teacher_backbone,
         "teacher_mode": teacher_mode,
+        "teacher_centers_path": str(args.teacher_centers_path) if args.teacher_centers_path is not None else None,
+        "adadistill_weight": args.adadistill_weight,
+        "teacher_logit_scale": args.teacher_logit_scale,
         "device": str(device),
         "output_prefix": args.output_prefix,
         "max_train_batches_per_epoch": args.max_train_batches_per_epoch,
         "max_val_batches": args.max_val_batches,
+        "max_classes": args.max_classes,
+        "max_samples_per_class": args.max_samples_per_class,
     }
 
     print(
@@ -482,7 +665,7 @@ def main() -> None:
     print(f"🧭 Train counts: {dataset_diagnostics['train_class_counts']}")
     print(f"🧭 Val counts: {dataset_diagnostics['val_class_counts']}")
     print(f"🧭 Student bootstrap enabled: {not args.skip_student_bootstrap}")
-    print(f"🧭 KD enabled: {kd_enabled} | Teacher mode: {teacher_mode}")
+    print(f"🧭 KD enabled: {kd_enabled} | KD mode: {args.kd_mode} | Teacher mode: {teacher_mode}")
     print(
         f"🧭 Partial epoch: train_batches="
         f"{args.max_train_batches_per_epoch if args.max_train_batches_per_epoch is not None else 'full'} | "
@@ -490,7 +673,12 @@ def main() -> None:
     )
 
     adaface_criterion = AdaFaceLoss(embedding_size=args.embedding_dim, num_classes=len(class_names)).to(device)
-    kd_criterion = EmbeddingKDLoss(alpha=args.kd_alpha).to(device) if kd_enabled else None
+    kd_criterion = EmbeddingKDLoss(alpha=args.kd_alpha).to(device) if kd_enabled and args.kd_mode == "embedding_mse" else None
+    adadistill_criterion = (
+        AdaDistillLoss(weight=args.adadistill_weight, scale=args.teacher_logit_scale).to(device)
+        if kd_enabled and args.kd_mode == "adadistill"
+        else None
+    )
     optimizer = optim.AdamW(
         [
             {"params": student_model.parameters(), "weight_decay": 5e-4},
@@ -514,6 +702,11 @@ def main() -> None:
         train_total = 0
         train_cosine_sum = 0.0
         train_cosine_batches = 0
+        adadistill_p_sum = 0.0
+        adadistill_gt_conf_sum = 0.0
+        adadistill_easy_sum = 0.0
+        adadistill_hard_sum = 0.0
+        adadistill_batches = 0
         processed_train_batches = 0
 
         for batch_idx, (images, labels) in enumerate(train_loader):
@@ -528,14 +721,24 @@ def main() -> None:
 
             with amp.autocast(device_type=device_type, enabled=(device_type == "cuda")):
                 student_embeddings, student_norms = student_model(images)
-                loss_adaface = adaface_criterion(student_embeddings, student_norms, labels)
+                student_supervised_logits = adaface_criterion.logits(student_embeddings, student_norms, labels)
+                loss_adaface = F.cross_entropy(student_supervised_logits, labels)
 
                 teacher_embeddings = None
-                if kd_enabled:
+                adadistill_stats: AdaDistillStats | None = None
+                if kd_enabled and args.kd_mode == "embedding_mse":
                     assert teacher_model is not None and kd_criterion is not None
                     with torch.no_grad():
                         teacher_embeddings, _ = teacher_model(images)
                     loss_kd = kd_criterion(student_embeddings, teacher_embeddings)
+                elif kd_enabled and args.kd_mode == "adadistill":
+                    assert adadistill_criterion is not None and teacher_centers is not None
+                    loss_kd, adadistill_stats = adadistill_criterion(
+                        student_embeddings=student_embeddings,
+                        student_classifier_weights=adaface_criterion.weights,
+                        teacher_centers=teacher_centers,
+                        labels=labels,
+                    )
                 else:
                     loss_kd = torch.zeros((), device=device)
 
@@ -559,6 +762,12 @@ def main() -> None:
                 ).mean().item()
                 train_cosine_sum += batch_cosine
                 train_cosine_batches += 1
+            if adadistill_stats is not None:
+                adadistill_p_sum += adadistill_stats.adaptive_p
+                adadistill_gt_conf_sum += adadistill_stats.gt_confidence
+                adadistill_easy_sum += adadistill_stats.loss_easy
+                adadistill_hard_sum += adadistill_stats.loss_hard
+                adadistill_batches += 1
             processed_train_batches += 1
 
             if batch_idx % 10 == 0:
@@ -568,15 +777,29 @@ def main() -> None:
                     if args.max_train_batches_per_epoch is not None
                     else len(train_loader)
                 )
+                extra_kd_log = ""
+                if adadistill_stats is not None:
+                    extra_kd_log = (
+                        f", p: {adadistill_stats.adaptive_p:.4f}, "
+                        f"gt_conf: {adadistill_stats.gt_confidence:.4f}, "
+                        f"L_easy: {adadistill_stats.loss_easy:.4f}, "
+                        f"L_hard: {adadistill_stats.loss_hard:.4f}"
+                    )
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Batch [{batch_idx}/{train_batch_total}] | "
-                    f"Loss: {loss.item():.4f} (AdaFace: {loss_adaface.item():.4f}, KD: {kd_log})"
+                    f"Loss: {loss.item():.4f} (AdaFace: {loss_adaface.item():.4f}, KD: {kd_log}{extra_kd_log})"
                 )
 
         train_accuracy = 100.0 * train_correct / max(1, train_total)
         train_cosine = (
             train_cosine_sum / max(1, train_cosine_batches) if kd_enabled and train_cosine_batches > 0 else None
         )
+        train_adadistill_p = adadistill_p_sum / max(1, adadistill_batches) if adadistill_batches > 0 else None
+        train_adadistill_gt_conf = (
+            adadistill_gt_conf_sum / max(1, adadistill_batches) if adadistill_batches > 0 else None
+        )
+        train_adadistill_easy = adadistill_easy_sum / max(1, adadistill_batches) if adadistill_batches > 0 else None
+        train_adadistill_hard = adadistill_hard_sum / max(1, adadistill_batches) if adadistill_batches > 0 else None
 
         student_model.eval()
         val_correct = 0
@@ -590,14 +813,14 @@ def main() -> None:
                     break
                 images = images.to(device)
                 labels = labels.to(device)
-                student_embeddings, _ = student_model(images)
+                student_embeddings, student_norms = student_model(images)
                 logits = compute_classification_logits(student_embeddings, adaface_criterion.weights)
                 predictions = logits.argmax(dim=1)
                 val_correct += (predictions == labels).sum().item()
                 val_total += labels.size(0)
                 processed_val_batches += 1
 
-                if kd_enabled:
+                if kd_enabled and args.kd_mode == "embedding_mse":
                     assert teacher_model is not None
                     teacher_embeddings, _ = teacher_model(images)
                     batch_cosine = F.cosine_similarity(
@@ -623,6 +846,11 @@ def main() -> None:
                 "val_cosine": val_cosine,
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "kd_enabled": kd_enabled,
+                "kd_mode": args.kd_mode,
+                "train_adadistill_p": train_adadistill_p,
+                "train_adadistill_gt_conf": train_adadistill_gt_conf,
+                "train_adadistill_easy": train_adadistill_easy,
+                "train_adadistill_hard": train_adadistill_hard,
                 "processed_train_batches": processed_train_batches,
                 "processed_val_batches": processed_val_batches,
             }
@@ -634,6 +862,11 @@ def main() -> None:
             f"Val Acc: {val_accuracy:.2f}% | Train Cosine: {format_optional_metric(train_cosine)} | "
             f"Val Cosine: {format_optional_metric(val_cosine)}"
         )
+        if train_adadistill_p is not None:
+            print(
+                f"   ↳ AdaDistill | p: {train_adadistill_p:.4f} | gt_conf: {train_adadistill_gt_conf:.4f} | "
+                f"L_easy: {train_adadistill_easy:.4f} | L_hard: {train_adadistill_hard:.4f}"
+            )
 
         epoch_checkpoint = args.checkpoints_dir / f"{args.output_prefix}_ep{epoch + 1}.pth"
         payload = checkpoint_payload(student_model, epoch + 1, val_accuracy, args, run_diagnostics)
