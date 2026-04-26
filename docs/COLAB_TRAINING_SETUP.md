@@ -1,36 +1,43 @@
 # Colab Training Setup
 
-Tài liệu này mô tả cách chạy huấn luyện trên Google Colab khi dataset đã nằm trên Google Drive.
+Tài liệu này mô tả setup Colab theo đúng flow vận hành hiện tại của repo:
 
-Flow khuyến nghị cho repo hiện tại:
+1. public pretraining trên dataset lớn
+2. clean-core finetune trên dữ liệu nội bộ
+3. full-dataset finetune trên dữ liệu nội bộ
+4. internal held-out evaluation
 
-1. public face pretraining trên dataset lớn ở Drive
-2. finetune trên `clean-core`
-3. finetune tiếp trên full internal dataset
+Chiến lược này giữ nguyên:
 
-Không dùng KD hoặc pruning ở bước đầu trên Colab.
+- `widened`
+- `rank_ratio=0.7`
+- `AdaFace-only`
+- không KD ở giai đoạn này
+- không pruning ở giai đoạn này
 
-## 1. Cấu trúc thư mục nên có trên Google Drive
+## 1. Cấu trúc thư mục trên Drive
 
-Ví dụ:
+Tối thiểu nên có:
 
 ```text
 MyDrive/
-  Face-Recognition-Workspace/
-    Attendance_Workspace/
-      3_edgeface_training/
-        requirements.txt
-        scripts/
-        checkpoints/
-        notebooks/
-      2_face_dataset_clean_core_split/
-        train/
-        val/
-        test/
-      2_face_dataset_split/
-        train/
-        val/
-        test/
+  Attendance_Workspace/
+    3_edgeface_training/
+      requirements.txt
+      scripts/
+      models/
+      core_losses/
+      dataloaders/
+      checkpoints/
+      notebooks/
+    2_face_dataset_clean_core_split/
+      train/
+      val/
+      test/
+    2_face_dataset_split/
+      train/
+      val/
+      test/
   Face_Recognition/
     raw_videos/
     train/
@@ -47,152 +54,229 @@ MyDrive/
       ...
 ```
 
-Điểm quan trọng:
+Lưu ý quan trọng:
 
-- public dataset phải có cấu trúc `train/` và `val/`
-- `train/` có thể là dạng shard nhiều tầng như `n002_044/n000002/...`; loader hiện tại đã hỗ trợ trực tiếp
-- internal split cũng nên có `train/`, `val/`, `test/`
-- checkpoint nên lưu ngay trong `3_edgeface_training/checkpoints/` để không mất khi runtime reset
+- public dataset dùng để train hiện tại là `Face_Recognition/train`
+- không dùng trực tiếp `Face_Recognition/val` trong `train_phase3.py`
+- lý do: `val/` của dataset public này không cùng class space với `train/`
 
-## 2. Mở notebook bằng Colab
+## 2. Các notebook đã được chuẩn bị
 
-Notebook đã được chuẩn bị sẵn tại:
+### Public pretraining
 
-- [3_edgeface_training/notebooks/colab_public_pretrain.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_public_pretrain.ipynb)
+- [colab_public_pretrain.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_public_pretrain.ipynb)
 
-Bạn có thể dùng một trong hai cách:
+Notebook này có 4 preset:
 
-1. Upload notebook này lên Google Drive rồi chọn `Open with > Google Colaboratory`
-2. Cài extension Colab trong VS Code và mở trực tiếp file `.ipynb`
+- `smoke`
+- `mid`
+- `e10`
+- `full`
 
-Khi chạy, cần chọn runtime GPU trong Colab:
+Mặc định hiện tại nên bắt đầu bằng:
 
-- `Runtime > Change runtime type > GPU`
+- `ACTIVE_STAGE = 'mid'`
 
-## 3. Stage A: Public Pretraining trên dataset lớn
+### Internal finetuning
 
-Notebook hiện mặc định cho stage này.
+- [colab_internal_finetune.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_internal_finetune.ipynb)
 
-Path mặc định trong notebook:
+Notebook này có 2 preset:
 
-- `PROJECT_ROOT=/content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training`
-- `DATASET_ROOT=/content/drive/MyDrive/Face_Recognition`
+- `clean_core`
+- `full_ft`
 
-Notebook sẽ:
+### Internal evaluation
 
-- mount Google Drive
-- kiểm tra tồn tại của project và dataset
-- cài `requirements.txt`
-- chạy `train_phase3.py` với cấu hình:
-  - `width_preset=widened`
-  - `rank_ratio=0.7`
-  - `kd_alpha=0`
-  - `skip_student_bootstrap=True`
-  - `skip_teacher_bootstrap=True`
+- [colab_internal_evaluate.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_internal_evaluate.ipynb)
 
-Checkpoint đầu ra dự kiến:
+Notebook này dùng để evaluate checkpoint cuối trên internal held-out split.
 
-- `checkpoints/phase3_public_pretrain_best.pth`
-- `checkpoints/phase3_public_pretrain_metrics.json`
+## 3. Stage A: Public Pretraining
 
-## 4. Stage B: Finetune trên clean-core
+Notebook:
 
-Sau khi có checkpoint pretrain tốt nhất, chạy tiếp trên Colab hoặc local:
+- [colab_public_pretrain.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_public_pretrain.ipynb)
 
-```bash
-cd /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training
+Path mặc định:
 
-python scripts/train_phase3.py \
-  --dataset-root /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/2_face_dataset_clean_core_split \
-  --checkpoints-dir /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/checkpoints \
-  --width-preset widened \
-  --rank-ratio 0.7 \
-  --kd-alpha 0 \
-  --skip-teacher-bootstrap \
-  --student-weights checkpoints/phase3_public_pretrain_best.pth \
-  --epochs 40 \
-  --learning-rate 5e-5 \
-  --batch-size 64 \
-  --num-workers 2 \
-  --output-prefix phase3_public_to_clean_core
-```
+- `PROJECT_ROOT=/content/drive/MyDrive/Attendance_Workspace/3_edgeface_training`
+- `DATASET_ROOT=/content/drive/MyDrive/Face_Recognition/train`
 
-## 5. Stage C: Finetune trên full internal dataset
+Presets:
 
-```bash
-cd /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training
+### `smoke`
 
-python scripts/train_phase3.py \
-  --dataset-root /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/2_face_dataset_split \
-  --checkpoints-dir /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/checkpoints \
-  --width-preset widened \
-  --rank-ratio 0.7 \
-  --kd-alpha 0 \
-  --skip-teacher-bootstrap \
-  --student-weights checkpoints/phase3_public_to_clean_core_best.pth \
-  --epochs 10 \
-  --learning-rate 5e-5 \
-  --batch-size 64 \
-  --num-workers 2 \
-  --output-prefix phase3_cleancore_to_full_ft
-```
+- `epochs = 3`
+- `batch_size = 32`
+- `max_train_batches_per_epoch = 200`
+- `max_val_batches = 50`
 
-## 6. Stage D: Evaluate trên internal held-out split
+Mục tiêu:
 
-```bash
-cd /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training
+- xác nhận pipeline chạy đúng
 
-python scripts/evaluate_paper_metrics.py \
-  --checkpoint checkpoints/phase3_cleancore_to_full_ft_best.pth \
-  --dataset-root /content/drive/MyDrive/Face-Recognition-Workspace/Attendance_Workspace/2_face_dataset_split \
-  --num-workers 0 \
-  --report-json checkpoints/phase3_cleancore_to_full_ft_eval.json
-```
+### `mid`
 
-## 7. Cấu hình Colab khuyến nghị
+- `epochs = 5`
+- `batch_size = 32`
+- `max_train_batches_per_epoch = 500`
+- `max_val_batches = 100`
 
-Mặc định an toàn:
+Mục tiêu:
 
-- `batch_size=64`
-- `num_workers=2`
-- `epochs=20` cho public pretrain smoke run đầu tiên
+- xác nhận learning signal có thật
 
-Nếu GPU nhỏ hoặc Colab báo out-of-memory:
+### `e10`
 
-- giảm `batch_size` xuống `32`
-- nếu vẫn lỗi, giảm xuống `16`
+- `epochs = 10`
+- `batch_size = 64`
+- `max_train_batches_per_epoch = 1000`
+- `max_val_batches = 200`
 
-Nếu Drive I/O chậm:
+Mục tiêu:
 
-- giữ `num_workers` thấp (`2` hoặc `0`)
-- tránh đặt quá cao vì Colab không phải lúc nào cũng đọc Drive tốt
+- tạo run public pretraining đầu tiên đủ ý nghĩa
 
-## 8. Những gì không nên làm
+### `full`
 
-Không nên:
+- `epochs = 20`
+- `batch_size = 64`
+- `max_train_batches_per_epoch = 2000`
+- `max_val_batches = 300`
 
-- train full public dataset ngay với KD
-- dùng pruning trong public pretraining stage
-- trộn class public dataset vào `2_face_dataset`
-- kỳ vọng checkpoint public là metric cuối; metric cuối vẫn phải là held-out internal split
+Mục tiêu:
 
-## 9. Checklist chạy thật
+- tạo checkpoint public-pretrained mạnh nhất để seed internal finetuning
 
-Trước khi bấm run trên Colab, kiểm tra:
+## 4. Decision Rule cho public pretraining
 
-- runtime đã là GPU
-- notebook mount đúng Drive
-- `PROJECT_ROOT` đúng thư mục project
-- `DATASET_ROOT` đúng thư mục dataset public
-- trong dataset có `train/` và `val/`
-- checkpoint output nằm trên Drive, không nằm ở `/content` tạm thời
+### Sau `smoke`
 
-## 10. Kết luận
+Yêu cầu:
 
-Setup tốt nhất cho repo hiện tại là:
+- không crash
+- loss giảm
+- checkpoint được lưu
+- runtime là `cuda`
 
-- Colab cho public pretraining
-- local hoặc Colab cho internal finetuning
-- internal held-out split là chuẩn đánh giá cuối
+### Sau `mid`
 
-Đây là hướng phù hợp nhất với codebase hiện tại và không làm thay đổi flow tối ưu `8.2 -> 8.6`.
+Yêu cầu:
+
+- train loss giảm tiếp so với smoke
+- train accuracy tăng rõ hơn smoke
+- val accuracy có xu hướng đi lên
+
+Nếu không đạt:
+
+- giảm `num_workers` nếu Drive I/O kém
+- giữ nguyên kiến trúc và loss
+- không bật KD
+
+### Sau `e10`
+
+Yêu cầu:
+
+- validation vẫn đang tăng
+- run này tốt hơn `mid`
+
+Nếu đạt:
+
+- mới chuyển sang `full`
+
+Nếu không đạt:
+
+- dừng scale tiếp
+- xem lại learning curve trước khi đốt thêm GPU
+
+## 5. Stage B: Clean-core finetune
+
+Notebook:
+
+- [colab_internal_finetune.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_internal_finetune.ipynb)
+
+Preset:
+
+- `ACTIVE_STAGE = 'clean_core'`
+
+Mặc định:
+
+- checkpoint đầu vào:
+  - `checkpoints/phase3_public_pretrain_best.pth`
+- dataset:
+  - `2_face_dataset_clean_core_split`
+- `epochs = 30`
+- `learning_rate = 5e-5`
+- `batch_size = 64`
+- no KD
+
+Mục tiêu:
+
+- học identity sinh viên trên tập sạch nhất
+
+## 6. Stage C: Full-dataset finetune
+
+Notebook:
+
+- [colab_internal_finetune.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_internal_finetune.ipynb)
+
+Preset:
+
+- `ACTIVE_STAGE = 'full_ft'`
+
+Mặc định:
+
+- checkpoint đầu vào:
+  - `checkpoints/phase3_public_to_clean_core_best.pth`
+- dataset:
+  - `2_face_dataset_split`
+- `epochs = 10`
+- `learning_rate = 5e-5`
+- `batch_size = 64`
+- no KD
+
+Mục tiêu:
+
+- hấp thụ blur, pose, và lighting variation từ full dataset
+
+## 7. Stage D: Internal evaluation
+
+Notebook:
+
+- [colab_internal_evaluate.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_internal_evaluate.ipynb)
+
+Đầu ra mong đợi:
+
+- pairwise accuracy
+- FAR
+- FRR tại FAR `1e-3`
+- threshold
+- params / FLOPs / latency / FPS
+
+Metric cuối cùng để ra quyết định vẫn phải là:
+
+- internal held-out evaluation
+
+Không dùng public-dataset accuracy làm metric cuối cho bài toán điểm danh.
+
+## 8. Operational Best Practices
+
+- mỗi run phải có `output_prefix` riêng
+- không overwrite checkpoint tốt nhất
+- giữ `KD disabled`
+- không pruning trước khi internal verification đủ mạnh
+- ưu tiên tăng `max_train_batches_per_epoch` trước khi tăng full epoch
+- nếu Drive đọc chậm, giảm `num_workers` xuống `1` hoặc `0`
+- nếu GPU memory yếu, giảm `batch_size` trước khi đổi kiến trúc
+
+## 9. Kết luận
+
+Flow tốt nhất hiện tại trên Colab là:
+
+1. `public_pretrain: smoke -> mid -> e10 -> full`
+2. `internal_finetune: clean_core`
+3. `internal_finetune: full_ft`
+4. `internal_evaluate`
+
+Đây là flow đúng nhất với codebase hiện tại và đúng với trạng thái thực nghiệm hiện có.

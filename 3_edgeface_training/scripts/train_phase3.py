@@ -56,6 +56,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
+        "--max-train-batches-per-epoch",
+        type=int,
+        default=None,
+        help="Limit the number of training batches processed in each epoch. Useful for Colab smoke runs on huge datasets.",
+    )
+    parser.add_argument(
+        "--max-val-batches",
+        type=int,
+        default=None,
+        help="Limit the number of validation batches processed in each epoch.",
+    )
+    parser.add_argument(
         "--output-prefix",
         default="phase3_widened_model",
         help="Prefix for checkpoint and metrics files inside checkpoints-dir.",
@@ -347,6 +359,10 @@ def main() -> None:
         raise ValueError("kd_alpha must be >= 0.")
     if args.max_missing_ratio < 0 or args.max_unexpected_ratio < 0:
         raise ValueError("Bootstrap mismatch ratios must be >= 0.")
+    if args.max_train_batches_per_epoch is not None and args.max_train_batches_per_epoch <= 0:
+        raise ValueError("max_train_batches_per_epoch must be > 0 when provided.")
+    if args.max_val_batches is not None and args.max_val_batches <= 0:
+        raise ValueError("max_val_batches must be > 0 when provided.")
     if args.kd_alpha > 0 and args.skip_teacher_bootstrap and not args.teacher_pretrained_imagenet:
         raise ValueError(
             "KD requires a compatible teacher. Use --teacher-pretrained-imagenet or do not skip teacher bootstrap."
@@ -451,6 +467,8 @@ def main() -> None:
         "teacher_mode": teacher_mode,
         "device": str(device),
         "output_prefix": args.output_prefix,
+        "max_train_batches_per_epoch": args.max_train_batches_per_epoch,
+        "max_val_batches": args.max_val_batches,
     }
 
     print(
@@ -465,6 +483,11 @@ def main() -> None:
     print(f"🧭 Val counts: {dataset_diagnostics['val_class_counts']}")
     print(f"🧭 Student bootstrap enabled: {not args.skip_student_bootstrap}")
     print(f"🧭 KD enabled: {kd_enabled} | Teacher mode: {teacher_mode}")
+    print(
+        f"🧭 Partial epoch: train_batches="
+        f"{args.max_train_batches_per_epoch if args.max_train_batches_per_epoch is not None else 'full'} | "
+        f"val_batches={args.max_val_batches if args.max_val_batches is not None else 'full'}"
+    )
 
     adaface_criterion = AdaFaceLoss(embedding_size=args.embedding_dim, num_classes=len(class_names)).to(device)
     kd_criterion = EmbeddingKDLoss(alpha=args.kd_alpha).to(device) if kd_enabled else None
@@ -491,8 +514,14 @@ def main() -> None:
         train_total = 0
         train_cosine_sum = 0.0
         train_cosine_batches = 0
+        processed_train_batches = 0
 
         for batch_idx, (images, labels) in enumerate(train_loader):
+            if (
+                args.max_train_batches_per_epoch is not None
+                and batch_idx >= args.max_train_batches_per_epoch
+            ):
+                break
             images = images.to(device)
             labels = labels.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -530,11 +559,17 @@ def main() -> None:
                 ).mean().item()
                 train_cosine_sum += batch_cosine
                 train_cosine_batches += 1
+            processed_train_batches += 1
 
             if batch_idx % 10 == 0:
                 kd_log = "disabled" if not kd_enabled else f"{loss_kd.item():.4f}"
+                train_batch_total = (
+                    args.max_train_batches_per_epoch
+                    if args.max_train_batches_per_epoch is not None
+                    else len(train_loader)
+                )
                 print(
-                    f"Epoch [{epoch + 1}/{args.epochs}] | Batch [{batch_idx}/{len(train_loader)}] | "
+                    f"Epoch [{epoch + 1}/{args.epochs}] | Batch [{batch_idx}/{train_batch_total}] | "
                     f"Loss: {loss.item():.4f} (AdaFace: {loss_adaface.item():.4f}, KD: {kd_log})"
                 )
 
@@ -548,8 +583,11 @@ def main() -> None:
         val_total = 0
         val_cosine_sum = 0.0
         val_cosine_batches = 0
+        processed_val_batches = 0
         with torch.no_grad():
-            for images, labels in val_loader:
+            for val_batch_idx, (images, labels) in enumerate(val_loader):
+                if args.max_val_batches is not None and val_batch_idx >= args.max_val_batches:
+                    break
                 images = images.to(device)
                 labels = labels.to(device)
                 student_embeddings, _ = student_model(images)
@@ -557,6 +595,7 @@ def main() -> None:
                 predictions = logits.argmax(dim=1)
                 val_correct += (predictions == labels).sum().item()
                 val_total += labels.size(0)
+                processed_val_batches += 1
 
                 if kd_enabled:
                     assert teacher_model is not None
@@ -573,7 +612,7 @@ def main() -> None:
         val_cosine = (
             val_cosine_sum / max(1, val_cosine_batches) if kd_enabled and val_cosine_batches > 0 else None
         )
-        avg_loss = total_loss / max(1, len(train_loader))
+        avg_loss = total_loss / max(1, processed_train_batches)
         history.append(
             {
                 "epoch": epoch + 1,
@@ -584,6 +623,8 @@ def main() -> None:
                 "val_cosine": val_cosine,
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "kd_enabled": kd_enabled,
+                "processed_train_batches": processed_train_batches,
+                "processed_val_batches": processed_val_batches,
             }
         )
 

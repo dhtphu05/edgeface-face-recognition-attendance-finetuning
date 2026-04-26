@@ -65,6 +65,8 @@ Các track có `review_status=auto_matched` là gợi ý mạnh, nhưng vẫn n�
   [docs/TRAINING_BEST_PRACTICES.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/TRAINING_BEST_PRACTICES.md)
 - Hướng dẫn setup training trên Google Colab với dataset đã nằm trên Google Drive:
   [docs/COLAB_TRAINING_SETUP.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/COLAB_TRAINING_SETUP.md)
+- Ghi chú checkpoint về mức độ khớp giữa setup Colab hiện tại và pipeline nghiên cứu:
+  [docs/COLAB_PIPELINE_CHECKPOINT.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/COLAB_PIPELINE_CHECKPOINT.md)
 - Chiến lược tốt nhất hiện tại cho bài toán này khi có public face dataset lớn:
   [docs/PUBLIC_PRETRAINING_STRATEGY.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/PUBLIC_PRETRAINING_STRATEGY.md)
 - Bảng đối chiếu trạng thái thực tế của pipeline `8.2 -> 8.6`:
@@ -74,9 +76,11 @@ Các track có `review_status=auto_matched` là gợi ý mạnh, nhưng vẫn n�
 
 ## Colab
 
-Notebook Colab cho public pretraining:
+Notebooks Colab:
 
 - [3_edgeface_training/notebooks/colab_public_pretrain.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_public_pretrain.ipynb)
+- [3_edgeface_training/notebooks/colab_internal_finetune.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_internal_finetune.ipynb)
+- [3_edgeface_training/notebooks/colab_internal_evaluate.ipynb](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/3_edgeface_training/notebooks/colab_internal_evaluate.ipynb)
 
 ## Ghi chú
 
