@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from PIL import Image
 from torch import amp
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
@@ -24,8 +27,10 @@ from core_losses.adaface_loss import AdaFaceLoss
 from core_losses.adadistill_loss import AdaDistillLoss, AdaDistillStats
 from core_losses.kd_loss import EmbeddingKDLoss
 from dataloaders.dataset import HierarchicalImageFolder, resolve_dataset_split_dirs
-from models.edgeface_xxs import MODEL_PRESETS, EdgeFaceXXS
+from models.domain_adversarial import DomainDiscriminator, GradientReversalLayer
+from models.edgeface_xxs import MODEL_PRESETS
 from models.iresnet_adaface_teacher import IResNet101AdaFaceTeacher
+from models.model_factory import build_model, build_model_from_metadata
 from models.resnet101_teacher import ResNet101Teacher
 
 
@@ -35,10 +40,63 @@ def compute_classification_logits(embeddings: torch.Tensor, classifier_weights: 
     return F.linear(normalized_embeddings, normalized_weights)
 
 
+def prepare_teacher_inputs(images: torch.Tensor, teacher_backbone: str) -> torch.Tensor:
+    if teacher_backbone == "ir101_adaface":
+        return F.interpolate(images.float(), size=(112, 112), mode="bilinear", align_corners=False)
+    return images
+
+
+class DirectionalMotionBlur:
+    def __init__(self, probability: float, kernel_size: int) -> None:
+        self.probability = probability
+        self.kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+
+    def __call__(self, image):
+        if self.probability <= 0 or random.random() >= self.probability:
+            return image
+
+        direction = random.choice(["horizontal", "vertical", "diag_down", "diag_up"])
+        kernel = np.zeros((self.kernel_size, self.kernel_size), dtype=np.float32)
+        if direction == "horizontal":
+            row = self.kernel_size // 2
+            for column in range(self.kernel_size):
+                kernel[row, column] = 1.0 / self.kernel_size
+        elif direction == "vertical":
+            column = self.kernel_size // 2
+            for row in range(self.kernel_size):
+                kernel[row, column] = 1.0 / self.kernel_size
+        elif direction == "diag_down":
+            for index in range(self.kernel_size):
+                kernel[index, index] = 1.0 / self.kernel_size
+        else:
+            for index in range(self.kernel_size):
+                column = self.kernel_size - 1 - index
+                kernel[index, column] = 1.0 / self.kernel_size
+
+        image_array = np.asarray(image, dtype=np.float32) / 255.0
+        image_tensor = torch.from_numpy(image_array.transpose(2, 0, 1)).unsqueeze(0)
+        kernel_tensor = torch.from_numpy(kernel).view(1, 1, self.kernel_size, self.kernel_size)
+        kernel_tensor = kernel_tensor.repeat(3, 1, 1, 1)
+        padding = self.kernel_size // 2
+        blurred = F.conv2d(
+            F.pad(image_tensor, (padding, padding, padding, padding), mode="reflect"),
+            kernel_tensor,
+            groups=3,
+        )
+        blurred = blurred.squeeze(0).clamp(0.0, 1.0).numpy().transpose(1, 2, 0)
+        return Image.fromarray((blurred * 255.0).astype(np.uint8))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 3 training for EdgeFace student model.")
     parser.add_argument("--dataset-root", type=Path, default=WORKSPACE_ROOT / "2_face_dataset")
     parser.add_argument("--checkpoints-dir", type=Path, default=PROJECT_ROOT / "checkpoints")
+    parser.add_argument(
+        "--backbone",
+        choices=["edgeface_xxs", "edgeface_hybrid_kprpe"],
+        default="edgeface_xxs",
+        help="Student backbone family.",
+    )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -61,8 +119,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rank-ratio", type=float, default=0.7)
     parser.add_argument("--embedding-dim", type=int, default=512)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--attention-depth", type=int, default=1)
+    parser.add_argument("--kprpe-hidden-dim", type=int, default=32)
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--landmark-metadata-root", type=Path, default=None)
+    parser.add_argument("--motion-blur-prob", type=float, default=0.0)
+    parser.add_argument("--motion-blur-kernel-size", type=int, default=7)
     parser.add_argument(
         "--max-classes",
         type=int,
@@ -106,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--teacher-backbone",
-        choices=["resnet101_imagenet", "ir101_adaface"],
+        choices=["resnet101_imagenet", "ir101_adaface", "edgeface_ta"],
         default="resnet101_imagenet",
         help="Teacher architecture. AdaDistill faithful branch should use ir101_adaface.",
     )
@@ -122,11 +186,46 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Weight applied to the AdaDistill KD term.",
     )
+    parser.add_argument("--adaface-margin", type=float, default=0.4)
+    parser.add_argument("--adaface-scale", type=float, default=64.0)
+    parser.add_argument("--adaface-h", type=float, default=1.0)
+    parser.add_argument(
+        "--classifier-mode",
+        choices=["full", "partial_fc"],
+        default="full",
+        help="Classifier head mode. Partial FC is intended for large public-ID warmup only.",
+    )
+    parser.add_argument("--partial-fc-sample-rate", type=float, default=0.10)
+    parser.add_argument("--partial-fc-min-negatives", type=int, default=2048)
+    parser.add_argument("--partial-fc-seed", type=int, default=1234)
     parser.add_argument(
         "--teacher-logit-scale",
         type=float,
         default=64.0,
         help="Scale used when computing teacher-center logits in AdaDistill mode.",
+    )
+    parser.add_argument(
+        "--domain-adversarial",
+        action="store_true",
+        help="Enable domain-adversarial refinement during training.",
+    )
+    parser.add_argument(
+        "--domain-loss-weight",
+        type=float,
+        default=0.05,
+        help="Weight applied to the domain adversarial loss term.",
+    )
+    parser.add_argument(
+        "--domain-label-source",
+        choices=["session", "split_origin", "capture_condition"],
+        default="session",
+        help="Source used to derive domain labels for adversarial refinement.",
+    )
+    parser.add_argument(
+        "--domain-session-gap-ms",
+        type=int,
+        default=3000,
+        help="Session boundary gap when deriving session-based domain labels from timestamps.",
     )
     parser.add_argument(
         "--skip-student-bootstrap",
@@ -261,6 +360,8 @@ def maybe_load_bootstrap_weights(
 def _dataset_classes(dataset: Dataset) -> list[str]:
     if isinstance(dataset, Subset):
         return _dataset_classes(dataset.dataset)
+    if isinstance(dataset, (LandmarkMetadataDataset, DomainLabeledDataset)):
+        return _dataset_classes(dataset.base_dataset)
     if hasattr(dataset, "classes"):
         return list(dataset.classes)
     raise TypeError(f"Unsupported dataset type for class extraction: {type(dataset)!r}")
@@ -270,6 +371,10 @@ def _dataset_targets(dataset: Dataset) -> list[int]:
     if isinstance(dataset, Subset):
         base_targets = _dataset_targets(dataset.dataset)
         return [base_targets[index] for index in dataset.indices]
+    if isinstance(dataset, LandmarkMetadataDataset):
+        return _dataset_targets(dataset.base_dataset)
+    if isinstance(dataset, DomainLabeledDataset):
+        return _dataset_targets(dataset.base_dataset)
     if hasattr(dataset, "targets"):
         return list(dataset.targets)
     raise TypeError(f"Unsupported dataset type for target extraction: {type(dataset)!r}")
@@ -306,12 +411,178 @@ def maybe_limit_hierarchical_dataset(
     return dataset
 
 
+def _dataset_paths(dataset: Dataset) -> list[Path]:
+    if isinstance(dataset, Subset):
+        base_paths = _dataset_paths(dataset.dataset)
+        return [base_paths[index] for index in dataset.indices]
+    if isinstance(dataset, LandmarkMetadataDataset):
+        return list(dataset.paths)
+    if isinstance(dataset, DomainLabeledDataset):
+        return _dataset_paths(dataset.base_dataset)
+    if hasattr(dataset, "samples"):
+        return [Path(sample_path) for sample_path, _ in dataset.samples]
+    raise TypeError(f"Unsupported dataset type for path extraction: {type(dataset)!r}")
+
+
+def extract_timestamp_from_path(path: Path) -> int | None:
+    digit_tokens = re.findall(r"\d{6,}", path.stem)
+    if not digit_tokens:
+        return None
+    return int(max(digit_tokens, key=len))
+
+
+def extract_capture_condition(path: Path) -> str:
+    suffix = path.stem.split("_")[-1].lower()
+    known = {"straight", "left", "right", "up", "down"}
+    return suffix if suffix in known else "unknown"
+
+
+def _session_group_keys(paths: list[Path], session_gap_ms: int) -> dict[Path, str]:
+    keyed_paths: list[tuple[tuple[int, str], Path]] = []
+    untimed_paths: list[Path] = []
+    for path in paths:
+        timestamp = extract_timestamp_from_path(path)
+        if timestamp is None:
+            untimed_paths.append(path)
+        else:
+            keyed_paths.append(((timestamp, path.name), path))
+
+    keyed_paths.sort(key=lambda item: item[0])
+    labels: dict[Path, str] = {}
+    session_index = -1
+    last_timestamp: int | None = None
+    for (timestamp, _), path in keyed_paths:
+        if last_timestamp is None or timestamp - last_timestamp > session_gap_ms:
+            session_index += 1
+        labels[path] = f"session_{session_index}"
+        last_timestamp = timestamp
+
+    for path in untimed_paths:
+        prefix = "_".join(path.stem.split("_")[:2]) or path.stem
+        labels[path] = f"untimed_{prefix}"
+    return labels
+
+
+def resolve_domain_keys(
+    dataset: Dataset,
+    *,
+    dataset_root: Path,
+    domain_label_source: str,
+    session_gap_ms: int,
+) -> tuple[list[str], str]:
+    paths = _dataset_paths(dataset)
+
+    def split_origin_label(path: Path) -> str:
+        try:
+            relative = path.relative_to(dataset_root)
+            return relative.parts[0] if relative.parts else "unknown"
+        except ValueError:
+            return path.parts[-3] if len(path.parts) >= 3 else "unknown"
+
+    session_keys = _session_group_keys(paths, session_gap_ms=session_gap_ms)
+    capture_keys = {path: f"capture_{extract_capture_condition(path)}" for path in paths}
+    split_keys = {path: f"split_{split_origin_label(path)}" for path in paths}
+
+    source_to_keys = {
+        "session": session_keys,
+        "capture_condition": capture_keys,
+        "split_origin": split_keys,
+    }
+
+    selected_source = domain_label_source
+    selected_keys = source_to_keys[selected_source]
+    unique_count = len(set(selected_keys.values()))
+    if selected_source == "session" and unique_count > max(32, len(paths) // 3):
+        selected_source = "capture_condition"
+        selected_keys = capture_keys
+        unique_count = len(set(selected_keys.values()))
+        if unique_count <= 1:
+            selected_source = "split_origin"
+            selected_keys = split_keys
+
+    return [selected_keys[path] for path in paths], selected_source
+
+
+class DomainLabeledDataset(Dataset):
+    def __init__(self, base_dataset: Dataset, domain_labels: list[int]) -> None:
+        if len(base_dataset) != len(domain_labels):
+            raise ValueError("Domain label count must match dataset length.")
+        self.base_dataset = base_dataset
+        self.domain_labels = domain_labels
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, index: int):
+        base_item = self.base_dataset[index]
+        if len(base_item) == 2:
+            image, label = base_item
+            return image, label, self.domain_labels[index]
+        image, label, landmarks = base_item
+        return image, label, landmarks, self.domain_labels[index]
+
+
+class LandmarkMetadataDataset(Dataset):
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        metadata_root: Path | None = None,
+        image_size: int = 112,
+    ) -> None:
+        self.base_dataset = base_dataset
+        self.metadata_root = metadata_root
+        self.image_size = float(image_size)
+        self.paths = _dataset_paths(base_dataset)
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def _metadata_path_for(self, image_path: Path) -> Path | None:
+        if self.metadata_root is not None:
+            try:
+                relative = image_path.relative_to(Path(image_path.anchor))
+                candidate = self.metadata_root / relative.parent / f"{image_path.stem}.json"
+            except ValueError:
+                candidate = self.metadata_root / image_path.parent.name / f"{image_path.stem}.json"
+            if candidate.exists():
+                return candidate
+        candidate = image_path.with_suffix(".json")
+        return candidate if candidate.exists() else None
+
+    def _load_landmarks(self, image_path: Path) -> torch.Tensor:
+        metadata_path = self._metadata_path_for(image_path)
+        if metadata_path is None:
+            return torch.zeros((5, 2), dtype=torch.float32)
+
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        raw_landmarks = (
+            payload.get("landmarks")
+            or payload.get("kps")
+            or payload.get("keypoints")
+            or payload.get("five_points")
+        )
+        if raw_landmarks is None:
+            return torch.zeros((5, 2), dtype=torch.float32)
+        landmarks = torch.tensor(raw_landmarks, dtype=torch.float32).view(5, 2)
+        if torch.max(torch.abs(landmarks)) > 1.5:
+            landmarks = landmarks / self.image_size
+        return torch.clamp(landmarks, 0.0, 1.0)
+
+    def __getitem__(self, index: int):
+        image, label = self.base_dataset[index]
+        landmarks = self._load_landmarks(self.paths[index])
+        return image, label, landmarks
+
+
 def build_datasets(
     dataset_root: Path,
     val_split: float,
     seed: int,
     max_classes: int | None = None,
     max_samples_per_class: int | None = None,
+    landmark_metadata_root: Path | None = None,
+    motion_blur_prob: float = 0.0,
+    motion_blur_kernel_size: int = 7,
 ) -> tuple[Dataset, Dataset, list[str], dict[str, Any]]:
     split_dirs = resolve_dataset_split_dirs(dataset_root)
     dataset_structure = "structured" if "train" in split_dirs else "flat"
@@ -320,6 +591,7 @@ def build_datasets(
         [
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            DirectionalMotionBlur(probability=motion_blur_prob, kernel_size=motion_blur_kernel_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
@@ -421,6 +693,10 @@ def build_datasets(
         train_dataset = Subset(train_dataset_full, train_indices)
         val_dataset = Subset(val_dataset_full, val_indices)
 
+    if landmark_metadata_root is not None:
+        train_dataset = LandmarkMetadataDataset(train_dataset, metadata_root=landmark_metadata_root)
+        val_dataset = LandmarkMetadataDataset(val_dataset, metadata_root=landmark_metadata_root)
+
     train_class_names = _dataset_classes(train_dataset)
     val_class_names = _dataset_classes(val_dataset)
     diagnostics = {
@@ -433,6 +709,9 @@ def build_datasets(
         "val_class_counts": dataset_label_counts(val_dataset),
         "max_classes": max_classes,
         "max_samples_per_class": max_samples_per_class,
+        "landmark_metadata_root": None if landmark_metadata_root is None else str(landmark_metadata_root),
+        "motion_blur_prob": motion_blur_prob,
+        "motion_blur_kernel_size": motion_blur_kernel_size,
     }
     return train_dataset, val_dataset, class_names, diagnostics
 
@@ -442,7 +721,7 @@ def format_optional_metric(value: float | None) -> str:
 
 
 def checkpoint_payload(
-    model: EdgeFaceXXS,
+    model: torch.nn.Module,
     epoch: int,
     val_accuracy: float,
     args: argparse.Namespace,
@@ -488,6 +767,35 @@ def load_teacher_center_cache(
     return centers, diagnostics
 
 
+def build_model_from_checkpoint(weight_path: Path) -> torch.nn.Module:
+    checkpoint = torch.load(weight_path, map_location="cpu")
+    model, _ = build_model_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
+    state_dict = clean_state_dict(checkpoint)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise ValueError(
+            f"Checkpoint mismatch: missing={list(missing[:5])} unexpected={list(unexpected[:5])}"
+        )
+    return model
+
+
+def build_teacher_model(
+    *,
+    teacher_backbone: str,
+    teacher_weights: Path,
+    embedding_dim: int,
+    teacher_pretrained_imagenet: bool,
+) -> torch.nn.Module:
+    if teacher_backbone == "edgeface_ta":
+        return build_model_from_checkpoint(teacher_weights)
+    if teacher_backbone == "ir101_adaface":
+        return IResNet101AdaFaceTeacher(embedding_size=embedding_dim)
+    return ResNet101Teacher(
+        embedding_size=embedding_dim,
+        pretrained=teacher_pretrained_imagenet,
+    )
+
+
 def resolve_kd_enabled(args: argparse.Namespace) -> bool:
     if args.kd_mode == "none":
         return False
@@ -512,22 +820,37 @@ def main() -> None:
         raise ValueError("max_train_batches_per_epoch must be > 0 when provided.")
     if args.max_val_batches is not None and args.max_val_batches <= 0:
         raise ValueError("max_val_batches must be > 0 when provided.")
+    if not (0.0 <= args.motion_blur_prob <= 1.0):
+        raise ValueError("motion_blur_prob must be in [0, 1].")
+    if args.motion_blur_kernel_size <= 0:
+        raise ValueError("motion_blur_kernel_size must be > 0.")
+    if args.adaface_h <= 0:
+        raise ValueError("adaface_h must be > 0.")
+    if not (0.0 < args.partial_fc_sample_rate <= 1.0):
+        raise ValueError("partial_fc_sample_rate must be in (0, 1].")
+    if args.partial_fc_min_negatives < 0:
+        raise ValueError("partial_fc_min_negatives must be >= 0.")
     if args.kd_mode == "adadistill":
-        if args.teacher_backbone != "ir101_adaface":
-            raise ValueError("kd-mode=adadistill requires --teacher-backbone ir101_adaface.")
         if args.teacher_pretrained_imagenet:
             raise ValueError("AdaDistill faithful branch cannot use --teacher-pretrained-imagenet.")
         if args.teacher_centers_path is None:
             raise ValueError("kd-mode=adadistill requires --teacher-centers-path.")
+        if args.teacher_backbone == "resnet101_imagenet":
+            raise ValueError("kd-mode=adadistill requires teacher centers from ir101_adaface or edgeface_ta.")
     if (
         args.kd_mode == "embedding_mse"
         and args.kd_alpha > 0
         and args.skip_teacher_bootstrap
         and not args.teacher_pretrained_imagenet
+        and args.teacher_backbone != "edgeface_ta"
     ):
         raise ValueError(
             "KD requires a compatible teacher. Use --teacher-pretrained-imagenet or do not skip teacher bootstrap."
         )
+    if args.domain_loss_weight < 0:
+        raise ValueError("domain_loss_weight must be >= 0.")
+    if args.classifier_mode == "partial_fc" and args.kd_mode != "none":
+        print("ℹ️ Partial FC is enabled together with KD. This is supported but intended mainly for AdaFace supervision.")
 
     args.checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
@@ -537,7 +860,29 @@ def main() -> None:
         seed=args.seed,
         max_classes=args.max_classes,
         max_samples_per_class=args.max_samples_per_class,
+        landmark_metadata_root=args.landmark_metadata_root,
+        motion_blur_prob=args.motion_blur_prob,
+        motion_blur_kernel_size=args.motion_blur_kernel_size,
     )
+    active_domain_source = None
+    domain_key_to_index: dict[str, int] | None = None
+    domain_adversarial_enabled = args.domain_adversarial
+    if args.domain_adversarial:
+        train_domain_keys, active_domain_source = resolve_domain_keys(
+            train_dataset,
+            dataset_root=args.dataset_root,
+            domain_label_source=args.domain_label_source,
+            session_gap_ms=args.domain_session_gap_ms,
+        )
+        ordered_domain_keys = sorted(set(train_domain_keys))
+        if len(ordered_domain_keys) < 2:
+            print("ℹ️ Domain adversarial disabled: fewer than 2 distinct domains after label resolution.")
+            domain_adversarial_enabled = False
+        else:
+            domain_key_to_index = {domain_key: index for index, domain_key in enumerate(ordered_domain_keys)}
+            train_domain_labels = [domain_key_to_index[key] for key in train_domain_keys]
+            train_dataset = DomainLabeledDataset(train_dataset, train_domain_labels)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -553,18 +898,27 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    student_model = EdgeFaceXXS(
+    student_model = build_model(
+        backbone_name=args.backbone,
         embedding_dim=args.embedding_dim,
         width_preset=args.width_preset,
         stage_channels=args.stage_channels,
         rank_ratio=args.rank_ratio,
+        attention_heads=args.attention_heads,
+        attention_depth=args.attention_depth,
+        kprpe_hidden_dim=args.kprpe_hidden_dim,
     )
     student_param_count = sum(parameter.numel() for parameter in student_model.parameters())
 
     kd_enabled = resolve_kd_enabled(args)
+    active_classifier_mode = args.classifier_mode
+    if args.classifier_mode == "partial_fc" and len(class_names) <= max(args.partial_fc_min_negatives, args.batch_size * 4):
+        active_classifier_mode = "full"
     teacher_mode = "disabled"
     teacher_model: torch.nn.Module | None = None
     teacher_centers: torch.Tensor | None = None
+    domain_grl: GradientReversalLayer | None = None
+    domain_discriminator: DomainDiscriminator | None = None
     bootstrap_reports: dict[str, Any] = {
         "student": {
             "enabled": not args.skip_student_bootstrap,
@@ -590,13 +944,12 @@ def main() -> None:
         bootstrap_reports["student"] = {"enabled": False, "reason": "skip_student_bootstrap"}
 
     if kd_enabled and args.kd_mode == "embedding_mse":
-        if args.teacher_backbone == "ir101_adaface":
-            teacher_model = IResNet101AdaFaceTeacher(embedding_size=args.embedding_dim)
-        else:
-            teacher_model = ResNet101Teacher(
-                embedding_size=args.embedding_dim,
-                pretrained=args.teacher_pretrained_imagenet,
-            )
+        teacher_model = build_teacher_model(
+            teacher_backbone=args.teacher_backbone,
+            teacher_weights=args.teacher_weights,
+            embedding_dim=args.embedding_dim,
+            teacher_pretrained_imagenet=args.teacher_pretrained_imagenet,
+        )
         if args.teacher_pretrained_imagenet:
             teacher_mode = "imagenet_pretrained"
             bootstrap_reports["teacher"] = {
@@ -604,6 +957,13 @@ def main() -> None:
                 "reason": "teacher_pretrained_imagenet",
             }
             print("ℹ️ Teacher mode: torchvision ImageNet pretrained.")
+        elif args.teacher_backbone == "edgeface_ta":
+            teacher_mode = "edgeface_ta_checkpoint"
+            bootstrap_reports["teacher"] = {
+                "enabled": False,
+                "reason": "edgeface_ta_checkpoint_loaded_in_builder",
+                "path": str(args.teacher_weights),
+            }
         else:
             teacher_mode = f"{args.teacher_backbone}_checkpoint_bootstrap"
             teacher_model, bootstrap_reports["teacher"] = maybe_load_bootstrap_weights(
@@ -619,7 +979,7 @@ def main() -> None:
         for parameter in teacher_model.parameters():
             parameter.requires_grad = False
     elif kd_enabled and args.kd_mode == "adadistill":
-        teacher_mode = "ir101_global_centers"
+        teacher_mode = f"{args.teacher_backbone}_global_centers"
         teacher_centers, center_report = load_teacher_center_cache(args.teacher_centers_path, class_names, device)
         bootstrap_reports["teacher"] = {
             "enabled": False,
@@ -632,6 +992,13 @@ def main() -> None:
         bootstrap_reports["teacher"] = {"enabled": False, "reason": reason}
 
     student_model = student_model.to(device)
+    if domain_adversarial_enabled:
+        assert domain_key_to_index is not None and active_domain_source is not None
+        domain_grl = GradientReversalLayer(lambda_=1.0).to(device)
+        domain_discriminator = DomainDiscriminator(
+            input_dim=args.embedding_dim,
+            num_domains=len(domain_key_to_index),
+        ).to(device)
 
     run_diagnostics: dict[str, Any] = {
         "dataset": dataset_diagnostics,
@@ -641,9 +1008,16 @@ def main() -> None:
         "kd_enabled": kd_enabled,
         "kd_mode": args.kd_mode,
         "kd_alpha": args.kd_alpha,
+        "backbone": args.backbone,
         "teacher_backbone": args.teacher_backbone,
         "teacher_mode": teacher_mode,
         "teacher_centers_path": str(args.teacher_centers_path) if args.teacher_centers_path is not None else None,
+        "adaface_margin": args.adaface_margin,
+        "adaface_scale": args.adaface_scale,
+        "adaface_h": args.adaface_h,
+        "classifier_mode": active_classifier_mode,
+        "partial_fc_sample_rate": args.partial_fc_sample_rate,
+        "partial_fc_min_negatives": args.partial_fc_min_negatives,
         "adadistill_weight": args.adadistill_weight,
         "teacher_logit_scale": args.teacher_logit_scale,
         "device": str(device),
@@ -652,6 +1026,11 @@ def main() -> None:
         "max_val_batches": args.max_val_batches,
         "max_classes": args.max_classes,
         "max_samples_per_class": args.max_samples_per_class,
+        "domain_adversarial": domain_adversarial_enabled,
+        "domain_loss_weight": args.domain_loss_weight,
+        "domain_label_source": active_domain_source if active_domain_source is not None else args.domain_label_source,
+        "domain_count": len(domain_key_to_index) if domain_key_to_index is not None else 0,
+        "domain_session_gap_ms": args.domain_session_gap_ms,
     }
 
     print(
@@ -666,26 +1045,39 @@ def main() -> None:
     print(f"🧭 Val counts: {dataset_diagnostics['val_class_counts']}")
     print(f"🧭 Student bootstrap enabled: {not args.skip_student_bootstrap}")
     print(f"🧭 KD enabled: {kd_enabled} | KD mode: {args.kd_mode} | Teacher mode: {teacher_mode}")
+    if domain_adversarial_enabled:
+        print(
+            f"🧭 Domain adversarial enabled | source: {run_diagnostics['domain_label_source']} | "
+            f"domains: {run_diagnostics['domain_count']} | weight: {args.domain_loss_weight}"
+        )
     print(
         f"🧭 Partial epoch: train_batches="
         f"{args.max_train_batches_per_epoch if args.max_train_batches_per_epoch is not None else 'full'} | "
         f"val_batches={args.max_val_batches if args.max_val_batches is not None else 'full'}"
     )
 
-    adaface_criterion = AdaFaceLoss(embedding_size=args.embedding_dim, num_classes=len(class_names)).to(device)
+    adaface_criterion = AdaFaceLoss(
+        embedding_size=args.embedding_dim,
+        num_classes=len(class_names),
+        margin=args.adaface_margin,
+        scale=args.adaface_scale,
+        h=args.adaface_h,
+    ).to(device)
+    partial_fc_generator = torch.Generator(device="cpu")
+    partial_fc_generator.manual_seed(args.partial_fc_seed)
     kd_criterion = EmbeddingKDLoss(alpha=args.kd_alpha).to(device) if kd_enabled and args.kd_mode == "embedding_mse" else None
     adadistill_criterion = (
         AdaDistillLoss(weight=args.adadistill_weight, scale=args.teacher_logit_scale).to(device)
         if kd_enabled and args.kd_mode == "adadistill"
         else None
     )
-    optimizer = optim.AdamW(
-        [
-            {"params": student_model.parameters(), "weight_decay": 5e-4},
-            {"params": adaface_criterion.parameters(), "weight_decay": 5e-4},
-        ],
-        lr=args.learning_rate,
-    )
+    optimizer_params = [
+        {"params": student_model.parameters(), "weight_decay": 5e-4},
+        {"params": adaface_criterion.parameters(), "weight_decay": 5e-4},
+    ]
+    if domain_discriminator is not None:
+        optimizer_params.append({"params": domain_discriminator.parameters(), "weight_decay": 5e-4})
+    optimizer = optim.AdamW(optimizer_params, lr=args.learning_rate)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     device_type = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -697,11 +1089,16 @@ def main() -> None:
 
     for epoch in range(args.epochs):
         student_model.train()
+        if domain_discriminator is not None:
+            domain_discriminator.train()
         total_loss = 0.0
         train_correct = 0
         train_total = 0
         train_cosine_sum = 0.0
         train_cosine_batches = 0
+        domain_loss_sum = 0.0
+        domain_correct = 0
+        domain_total = 0
         adadistill_p_sum = 0.0
         adadistill_gt_conf_sum = 0.0
         adadistill_easy_sum = 0.0
@@ -709,27 +1106,51 @@ def main() -> None:
         adadistill_batches = 0
         processed_train_batches = 0
 
-        for batch_idx, (images, labels) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
             if (
                 args.max_train_batches_per_epoch is not None
                 and batch_idx >= args.max_train_batches_per_epoch
             ):
                 break
+            if domain_adversarial_enabled:
+                if len(batch) == 4:
+                    images, labels, landmarks, domain_labels = batch
+                else:
+                    images, labels, domain_labels = batch
+                    landmarks = None
+                domain_labels = domain_labels.to(device)
+            else:
+                if len(batch) == 3:
+                    images, labels, landmarks = batch
+                else:
+                    images, labels = batch
+                    landmarks = None
+                domain_labels = None
             images = images.to(device)
             labels = labels.to(device)
+            if landmarks is not None:
+                landmarks = landmarks.to(device)
             optimizer.zero_grad(set_to_none=True)
 
             with amp.autocast(device_type=device_type, enabled=(device_type == "cuda")):
-                student_embeddings, student_norms = student_model(images)
-                student_supervised_logits = adaface_criterion.logits(student_embeddings, student_norms, labels)
-                loss_adaface = F.cross_entropy(student_supervised_logits, labels)
+                student_embeddings, student_norms = student_model(images, landmarks=landmarks)
+                loss_adaface = adaface_criterion(
+                    student_embeddings,
+                    student_norms,
+                    labels,
+                    classifier_mode=active_classifier_mode,
+                    partial_fc_sample_rate=args.partial_fc_sample_rate,
+                    partial_fc_min_negatives=args.partial_fc_min_negatives,
+                    partial_fc_generator=partial_fc_generator,
+                )
 
                 teacher_embeddings = None
                 adadistill_stats: AdaDistillStats | None = None
                 if kd_enabled and args.kd_mode == "embedding_mse":
                     assert teacher_model is not None and kd_criterion is not None
                     with torch.no_grad():
-                        teacher_embeddings, _ = teacher_model(images)
+                        teacher_inputs = prepare_teacher_inputs(images, args.teacher_backbone)
+                        teacher_embeddings, _ = teacher_model(teacher_inputs)
                     loss_kd = kd_criterion(student_embeddings, teacher_embeddings)
                 elif kd_enabled and args.kd_mode == "adadistill":
                     assert adadistill_criterion is not None and teacher_centers is not None
@@ -742,7 +1163,15 @@ def main() -> None:
                 else:
                     loss_kd = torch.zeros((), device=device)
 
-                loss = loss_adaface + loss_kd
+                if domain_adversarial_enabled:
+                    assert domain_grl is not None and domain_discriminator is not None and domain_labels is not None
+                    domain_logits = domain_discriminator(domain_grl(student_embeddings))
+                    loss_domain = F.cross_entropy(domain_logits, domain_labels)
+                else:
+                    domain_logits = None
+                    loss_domain = torch.zeros((), device=device)
+
+                loss = loss_adaface + loss_kd + (args.domain_loss_weight * loss_domain)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -762,6 +1191,11 @@ def main() -> None:
                 ).mean().item()
                 train_cosine_sum += batch_cosine
                 train_cosine_batches += 1
+            if domain_logits is not None and domain_labels is not None:
+                domain_loss_sum += loss_domain.item()
+                domain_predictions = domain_logits.argmax(dim=1)
+                domain_correct += (domain_predictions == domain_labels).sum().item()
+                domain_total += domain_labels.size(0)
             if adadistill_stats is not None:
                 adadistill_p_sum += adadistill_stats.adaptive_p
                 adadistill_gt_conf_sum += adadistill_stats.gt_confidence
@@ -785,6 +1219,8 @@ def main() -> None:
                         f"L_easy: {adadistill_stats.loss_easy:.4f}, "
                         f"L_hard: {adadistill_stats.loss_hard:.4f}"
                     )
+                if domain_logits is not None:
+                    extra_kd_log += f", Domain: {loss_domain.item():.4f}"
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | Batch [{batch_idx}/{train_batch_total}] | "
                     f"Loss: {loss.item():.4f} (AdaFace: {loss_adaface.item():.4f}, KD: {kd_log}{extra_kd_log})"
@@ -800,6 +1236,8 @@ def main() -> None:
         )
         train_adadistill_easy = adadistill_easy_sum / max(1, adadistill_batches) if adadistill_batches > 0 else None
         train_adadistill_hard = adadistill_hard_sum / max(1, adadistill_batches) if adadistill_batches > 0 else None
+        train_domain_accuracy = 100.0 * domain_correct / max(1, domain_total) if domain_adversarial_enabled else None
+        train_domain_loss = domain_loss_sum / max(1, processed_train_batches) if domain_adversarial_enabled else None
 
         student_model.eval()
         val_correct = 0
@@ -808,12 +1246,18 @@ def main() -> None:
         val_cosine_batches = 0
         processed_val_batches = 0
         with torch.no_grad():
-            for val_batch_idx, (images, labels) in enumerate(val_loader):
+            for val_batch_idx, batch in enumerate(val_loader):
                 if args.max_val_batches is not None and val_batch_idx >= args.max_val_batches:
                     break
+                if len(batch) == 3:
+                    images, labels, landmarks = batch
+                    landmarks = landmarks.to(device)
+                else:
+                    images, labels = batch
+                    landmarks = None
                 images = images.to(device)
                 labels = labels.to(device)
-                student_embeddings, student_norms = student_model(images)
+                student_embeddings, student_norms = student_model(images, landmarks=landmarks)
                 logits = compute_classification_logits(student_embeddings, adaface_criterion.weights)
                 predictions = logits.argmax(dim=1)
                 val_correct += (predictions == labels).sum().item()
@@ -822,7 +1266,8 @@ def main() -> None:
 
                 if kd_enabled and args.kd_mode == "embedding_mse":
                     assert teacher_model is not None
-                    teacher_embeddings, _ = teacher_model(images)
+                    teacher_inputs = prepare_teacher_inputs(images, args.teacher_backbone)
+                    teacher_embeddings, _ = teacher_model(teacher_inputs)
                     batch_cosine = F.cosine_similarity(
                         student_embeddings.float(),
                         teacher_embeddings.float(),
@@ -851,6 +1296,8 @@ def main() -> None:
                 "train_adadistill_gt_conf": train_adadistill_gt_conf,
                 "train_adadistill_easy": train_adadistill_easy,
                 "train_adadistill_hard": train_adadistill_hard,
+                "train_domain_loss": train_domain_loss,
+                "train_domain_accuracy": train_domain_accuracy,
                 "processed_train_batches": processed_train_batches,
                 "processed_val_batches": processed_val_batches,
             }
@@ -866,6 +1313,10 @@ def main() -> None:
             print(
                 f"   ↳ AdaDistill | p: {train_adadistill_p:.4f} | gt_conf: {train_adadistill_gt_conf:.4f} | "
                 f"L_easy: {train_adadistill_easy:.4f} | L_hard: {train_adadistill_hard:.4f}"
+            )
+        if train_domain_loss is not None:
+            print(
+                f"   ↳ Domain | loss: {train_domain_loss:.4f} | train_acc: {train_domain_accuracy:.2f}%"
             )
 
         epoch_checkpoint = args.checkpoints_dir / f"{args.output_prefix}_ep{epoch + 1}.pth"

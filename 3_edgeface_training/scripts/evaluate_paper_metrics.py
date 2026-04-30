@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dataloaders.dataset import resolve_dataset_split_dirs
-from models.edgeface_xxs import EdgeFaceXXS, build_edgeface_config_from_metadata
+from models.model_factory import build_model_from_metadata
 from scripts.prune_phase4 import apply_structured_pruning
 
 
@@ -172,14 +172,7 @@ def main():
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-    config = build_edgeface_config_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
-
-    model = EdgeFaceXXS(
-        embedding_dim=config.embedding_dim,
-        width_preset=config.width_preset,
-        stage_channels=config.stage_channels,
-        rank_ratio=config.rank_ratio,
-    )
+    model, config = build_model_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
     if args.apply_pruning:
         print("✂️ Áp dụng pruning mask tương thích trước khi nạp trọng số...")
         model = apply_structured_pruning(model, prune_ratio=float(checkpoint.get("prune_ratio", 0.01)))

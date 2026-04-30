@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.edgeface_xxs import EdgeFaceXXS, build_edgeface_config_from_metadata
+from models.model_factory import build_model_from_metadata
 
 
 def calculate_l1_norm(weight_tensor):
@@ -64,14 +64,8 @@ def main():
 
     checkpoint = torch.load(args.input, map_location="cpu")
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-    config = build_edgeface_config_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
-
-    model = EdgeFaceXXS(
-        embedding_dim=config.embedding_dim,
-        width_preset=config.width_preset,
-        stage_channels=config.stage_channels,
-        rank_ratio=config.rank_ratio,
-    ).to(device)
+    model, _ = build_model_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
+    model = model.to(device)
     model.load_state_dict(state_dict)
     print("✅ Đã nạp thành công trọng số gốc từ Giai đoạn 3.")
 

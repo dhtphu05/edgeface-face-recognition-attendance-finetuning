@@ -16,12 +16,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataloaders.dataset import HierarchicalImageFolder, resolve_dataset_split_dirs
 from models.iresnet_adaface_teacher import IResNet101AdaFaceTeacher
+from models.model_factory import build_model_from_metadata
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build global teacher class centers for AdaDistill.")
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--teacher-weights", type=Path, default=PROJECT_ROOT / "weights" / "AdaFace_IR101.pt")
+    parser.add_argument(
+        "--teacher-backbone",
+        choices=["ir101_adaface", "edgeface_ta"],
+        default="ir101_adaface",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -43,8 +49,41 @@ def resolve_train_root(dataset_root: Path) -> Path:
     return split_dirs.get("train", split_dirs.get("all", dataset_root))
 
 
+def clean_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    elif isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+    cleaned_state_dict = {}
+    for key, value in state_dict.items():
+        cleaned_state_dict[key.replace("module.", "") if key.startswith("module.") else key] = value
+    return cleaned_state_dict
+
+
+def build_teacher_model(teacher_backbone: str, teacher_weights: Path) -> tuple[torch.nn.Module, int]:
+    checkpoint = torch.load(teacher_weights, map_location="cpu")
+    if teacher_backbone == "edgeface_ta":
+        model, config = build_model_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
+        missing, unexpected = model.load_state_dict(clean_state_dict(checkpoint), strict=False)
+        if missing or unexpected:
+            raise ValueError(
+                f"TA checkpoint mismatch during teacher center build: missing={list(missing[:5])} unexpected={list(unexpected[:5])}"
+            )
+        return model, config.embedding_dim
+
+    model = IResNet101AdaFaceTeacher(embedding_dim=512)
+    model.load_state_dict(checkpoint, strict=True)
+    return model, 512
+
+
 def main() -> None:
     args = parse_args()
+    args.teacher_weights = args.teacher_weights.resolve()
+    args.output = args.output.resolve()
     device = resolve_device()
     print(f"🚀 Building teacher centers on device: {device}")
 
@@ -83,15 +122,12 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    teacher = IResNet101AdaFaceTeacher(embedding_dim=512)
-    checkpoint = torch.load(args.teacher_weights, map_location="cpu")
-    teacher.load_state_dict(checkpoint, strict=True)
+    teacher, embedding_dim = build_teacher_model(args.teacher_backbone, args.teacher_weights)
     teacher = teacher.to(device)
     teacher.eval()
     for parameter in teacher.parameters():
         parameter.requires_grad = False
 
-    embedding_dim = 512
     centers_sum = torch.zeros(len(dataset.classes), embedding_dim, dtype=torch.float32)
     counts = torch.zeros(len(dataset.classes), dtype=torch.long)
 
@@ -114,6 +150,7 @@ def main() -> None:
     centers = F.normalize(centers_sum / counts.unsqueeze(1).float(), p=2, dim=1)
     payload = {
         "teacher_weights": str(args.teacher_weights),
+        "teacher_backbone": args.teacher_backbone,
         "dataset_root": str(args.dataset_root),
         "train_root": str(train_root),
         "embedding_dim": embedding_dim,

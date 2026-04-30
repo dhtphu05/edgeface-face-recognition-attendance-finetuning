@@ -15,8 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core_losses import AdaFaceLoss
 from dataloaders import build_dataloaders
-from models import EdgeFaceXXS
-from models.edgeface_xxs import build_edgeface_config_from_metadata
+from models.model_factory import build_model_from_metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,14 +51,8 @@ def main() -> None:
     )
 
     state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
-    config = build_edgeface_config_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
-
-    model = EdgeFaceXXS(
-        embedding_dim=config.embedding_dim,
-        width_preset=config.width_preset,
-        stage_channels=config.stage_channels,
-        rank_ratio=config.rank_ratio,
-    ).to(device)
+    model, config = build_model_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
+    model = model.to(device)
     model.load_state_dict(state_dict)
     criterion = AdaFaceLoss(embedding_size=config.embedding_dim, num_classes=len(class_names)).to(device)
     optimizer = AdamW(list(model.parameters()) + list(criterion.parameters()), lr=args.lr)
@@ -81,12 +74,9 @@ def main() -> None:
     payload = {
         **(checkpoint if isinstance(checkpoint, dict) else {}),
         "model_state_dict": model.state_dict(),
-        "embedding_dim": config.embedding_dim,
-        "width_preset": config.width_preset,
-        "stage_channels": list(config.resolved_stage_channels()),
-        "rank_ratio": config.rank_ratio,
         "finetuned_epochs": args.epochs,
     }
+    payload.update(config.to_metadata())
     torch.save(payload, args.output)
     print(f"Saved finetuned model to {args.output}")
 

@@ -13,11 +13,13 @@ MODEL_PRESETS: dict[str, tuple[int, int, int, int]] = {
     "legacy": (32, 64, 128, 256),
     "mid": (48, 96, 192, 384),
     "widened": (72, 144, 288, 576),
+    "teacher_assistant": (96, 192, 384, 768),
 }
 
 
 @dataclass(frozen=True)
 class EdgeFaceConfig:
+    backbone_name: str = "edgeface_xxs"
     embedding_dim: int = 512
     width_preset: str = "legacy"
     stage_channels: tuple[int, int, int, int] | None = None
@@ -34,6 +36,7 @@ class EdgeFaceConfig:
 
     def to_metadata(self) -> dict[str, object]:
         return {
+            "backbone_name": self.backbone_name,
             "embedding_dim": self.embedding_dim,
             "width_preset": self.width_preset,
             "stage_channels": list(self.resolved_stage_channels()),
@@ -72,6 +75,7 @@ def build_edgeface_config(
     rank_ratio: float = 0.6,
 ) -> EdgeFaceConfig:
     return EdgeFaceConfig(
+        backbone_name="edgeface_xxs",
         embedding_dim=_normalize_embedding_dim(embedding_dim, embedding_size),
         width_preset=width_preset,
         stage_channels=_normalize_stage_channels(stage_channels),
@@ -146,7 +150,7 @@ class EdgeFaceXXS(nn.Module):
     def get_config(self) -> EdgeFaceConfig:
         return self.config
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, landmarks: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.features(x)
         x = torch.flatten(x, 1)
         x = self.embedding(x)

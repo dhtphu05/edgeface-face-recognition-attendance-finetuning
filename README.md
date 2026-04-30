@@ -69,6 +69,10 @@ Các track có `review_status=auto_matched` là gợi ý mạnh, nhưng vẫn n�
   [docs/COLAB_PIPELINE_CHECKPOINT.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/COLAB_PIPELINE_CHECKPOINT.md)
 - Chiến lược tốt nhất hiện tại cho bài toán này khi có public face dataset lớn:
   [docs/PUBLIC_PRETRAINING_STRATEGY.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/PUBLIC_PRETRAINING_STRATEGY.md)
+- Runbook cho nhánh Feature-Only Distillation (FO v1) với teacher `AdaFace_IR101.pt`:
+  [docs/FO_DISTILLATION_V1.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/FO_DISTILLATION_V1.md)
+- Runbook cho Phase 4 hybrid branch với KP-RPE, Partial FC, và surveillance adaptation:
+  [docs/PHASE4_HYBRID_KPRPE.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/PHASE4_HYBRID_KPRPE.md)
 - Bảng đối chiếu trạng thái thực tế của pipeline `8.2 -> 8.6`:
   [docs/PIPELINE_STATUS.md](/Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/docs/PIPELINE_STATUS.md)
 - Báo cáo học thuật tiến độ theo format nghiên cứu:
