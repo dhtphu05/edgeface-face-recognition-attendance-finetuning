@@ -3,13 +3,23 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from insightface.app import FaceAnalysis
 from insightface.utils import face_align
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TRAINING_ROOT = PROJECT_ROOT / "3_edgeface_training"
+if str(TRAINING_ROOT) not in sys.path:
+    sys.path.insert(0, str(TRAINING_ROOT))
+
+from models.model_factory import build_model_from_metadata
 
 
 IMAGE_SIZE = 112
@@ -17,7 +27,7 @@ VERY_STRONG_EMBEDDING_DISTANCE = 0.25
 EMBEDDING_EMA_MOMENTUM = 0.8
 DEFAULT_AUTO_MATCH_THRESHOLD = 0.85
 DEFAULT_REVIEW_MARGIN = 0.03
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".pgm"}
 
 
 @dataclass
@@ -65,11 +75,20 @@ class Track:
     pending_frame_indices: list[int] = field(default_factory=list)
     pending_scores: list[float] = field(default_factory=list)
     pending_bbox_sizes: list[float] = field(default_factory=list)
+    recognition_embeddings: list[np.ndarray] = field(default_factory=list)
+    recognition_norms: list[float] = field(default_factory=list)
     saved_image_count: int = 0
     active: bool = True
     status: str = "active"
 
-    def update(self, detection: Detection) -> None:
+    def update(
+        self,
+        detection: Detection,
+        *,
+        aligned_face: np.ndarray,
+        recognition_embedding: np.ndarray | None = None,
+        recognition_norm: float | None = None,
+    ) -> None:
         detection_embedding = normalize_embedding(detection.embedding)
         self.prototype_embedding = normalize_embedding(
             (EMBEDDING_EMA_MOMENTUM * self.prototype_embedding)
@@ -81,12 +100,43 @@ class Track:
         self.pending_scores.append(float(detection.det_score))
         self.pending_bbox_sizes.append(float(detection.min_side))
         self.pending_frame_indices.append(detection.frame_idx)
-        aligned_face = face_align.norm_crop(
-            detection.frame_bgr,
-            landmark=detection.kps,
-            image_size=IMAGE_SIZE,
-        )
         self.pending_faces.append(aligned_face)
+        if recognition_embedding is not None and recognition_norm is not None:
+            self.recognition_embeddings.append(normalize_embedding(recognition_embedding))
+            self.recognition_norms.append(float(recognition_norm))
+
+
+class AttendanceRecognizer:
+    def __init__(self, checkpoint_path: Path, device_name: str | None = None) -> None:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Recognizer checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+        model, config = build_model_from_metadata(checkpoint if isinstance(checkpoint, dict) else None)
+        model.load_state_dict(state_dict)
+        self.model = model.eval()
+        self.config = config
+        if device_name is not None:
+            self.device = torch.device(device_name)
+        else:
+            self.device = torch.device(
+                "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+            )
+        self.model = self.model.to(self.device)
+
+    def extract(self, aligned_face_bgr: np.ndarray) -> tuple[np.ndarray, float]:
+        if aligned_face_bgr.shape[:2] != (IMAGE_SIZE, IMAGE_SIZE):
+            aligned_face_bgr = cv2.resize(aligned_face_bgr, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
+        image_rgb = cv2.cvtColor(aligned_face_bgr, cv2.COLOR_BGR2RGB)
+        image = image_rgb.astype(np.float32) / 255.0
+        image = (image - 0.5) / 0.5
+        image = np.transpose(image, (2, 0, 1))
+        tensor = torch.from_numpy(image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            embeddings, norms = self.model(tensor)
+        embedding_np = embeddings[0].detach().cpu().numpy().astype(np.float32)
+        norm_value = float(norms[0].detach().cpu().item())
+        return normalize_embedding(embedding_np), norm_value
 
 
 def normalize_embedding(embedding: np.ndarray) -> np.ndarray:
@@ -124,6 +174,35 @@ def compute_iou(lhs_bbox: np.ndarray, rhs_bbox: np.ndarray) -> float:
     if union <= 0:
         return 0.0
     return intersection / union
+
+
+def align_detection_face(detection: Detection) -> np.ndarray:
+    return face_align.norm_crop(
+        detection.frame_bgr,
+        landmark=detection.kps,
+        image_size=IMAGE_SIZE,
+    )
+
+
+def prepare_gallery_face(image_bgr: np.ndarray) -> np.ndarray:
+    if image_bgr.shape[:2] == (IMAGE_SIZE, IMAGE_SIZE):
+        return image_bgr
+    return cv2.resize(image_bgr, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
+
+
+def aggregate_track_embedding(
+    embeddings: list[np.ndarray],
+    norms: list[float],
+    max_window: int,
+) -> tuple[np.ndarray | None, float | None]:
+    if not embeddings:
+        return None, None
+    window_embeddings = embeddings[-max_window:]
+    window_norms = norms[-max_window:] if norms else [1.0] * len(window_embeddings)
+    weights = np.asarray([max(norm, 1e-6) for norm in window_norms], dtype=np.float32)
+    stacked = np.stack([normalize_embedding(embedding) for embedding in window_embeddings], axis=0)
+    weighted = (stacked * weights[:, None]).sum(axis=0) / np.clip(weights.sum(), 1e-6, None)
+    return normalize_embedding(weighted), float(weights.mean())
 
 
 def _build_face_app() -> FaceAnalysis:
@@ -283,6 +362,42 @@ def build_gallery(app: FaceAnalysis, gallery_dir: Path) -> list[GalleryIdentity]
     return identities
 
 
+def build_gallery_with_recognizer(
+    app: FaceAnalysis,
+    gallery_dir: Path,
+    recognizer: AttendanceRecognizer,
+) -> list[GalleryIdentity]:
+    identities: list[GalleryIdentity] = []
+    print(f"Building gallery with checkpoint recognizer from {gallery_dir} ...")
+    for class_dir in sorted(path for path in gallery_dir.iterdir() if path.is_dir()):
+        embeddings: list[np.ndarray] = []
+        for image_path in sorted(class_dir.iterdir()):
+            if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            image_bgr = cv2.imread(str(image_path))
+            if image_bgr is None:
+                continue
+            # Gallery images in this repo are already face crops. Prefer direct embedding
+            # and avoid re-running detection, which is brittle on tightly cropped faces.
+            prepared_face = prepare_gallery_face(image_bgr)
+            embedding, _ = recognizer.extract(prepared_face)
+            embeddings.append(embedding)
+
+        if not embeddings:
+            print(f"⚠️ No usable gallery embeddings for {class_dir.name}")
+            continue
+        prototype = normalize_embedding(np.mean(np.stack(embeddings, axis=0), axis=0))
+        identities.append(
+            GalleryIdentity(
+                student_id=class_dir.name,
+                prototype_embedding=prototype,
+                image_count=len(embeddings),
+            )
+        )
+    print(f"Built gallery identities={len(identities)}")
+    return identities
+
+
 def suggest_gallery_match(
     track_embedding: np.ndarray,
     gallery: list[GalleryIdentity],
@@ -342,6 +457,7 @@ def finalize_tracks(
     gallery: list[GalleryIdentity],
     auto_match_threshold: float,
     review_margin: float,
+    aggregation_window: int,
 ) -> tuple[list[dict[str, object]], int]:
     tracks_dir = video_output_dir / "tracks"
     tracks_dir.mkdir(parents=True, exist_ok=True)
@@ -349,8 +465,14 @@ def finalize_tracks(
     track_entries: list[dict[str, object]] = []
     dropped_count = 0
     for track in tracks:
+        aggregated_embedding, aggregated_norm = aggregate_track_embedding(
+            track.recognition_embeddings,
+            track.recognition_norms,
+            max_window=aggregation_window,
+        )
+        match_embedding = aggregated_embedding if aggregated_embedding is not None else track.prototype_embedding
         suggestion = suggest_gallery_match(
-            track_embedding=track.prototype_embedding,
+            track_embedding=match_embedding,
             gallery=gallery,
             auto_match_threshold=auto_match_threshold,
             review_margin=review_margin,
@@ -363,6 +485,9 @@ def finalize_tracks(
             "last_frame": track.last_seen_frame,
             "average_bbox_size": round(float(np.mean(track.pending_bbox_sizes)), 2) if track.pending_bbox_sizes else 0.0,
             "average_detection_score": round(float(np.mean(track.pending_scores)), 4) if track.pending_scores else 0.0,
+            "aggregation_window": aggregation_window,
+            "recognition_frames_used": min(len(track.recognition_embeddings), aggregation_window),
+            "track_aggregated_norm": None if aggregated_norm is None else round(float(aggregated_norm), 4),
             "status": "kept" if len(track.pending_faces) >= min_track_length else "dropped_short_track",
             **suggestion,
         }
@@ -467,6 +592,9 @@ def process_group_video_to_tracks(
     gallery_dir: str | None = None,
     auto_match_threshold: float = DEFAULT_AUTO_MATCH_THRESHOLD,
     review_margin: float = DEFAULT_REVIEW_MARGIN,
+    recognizer_checkpoint: str | None = None,
+    recognizer_device: str | None = None,
+    aggregation_window: int = 8,
 ) -> None:
     video_path_obj = Path(video_path).expanduser().resolve()
     output_base_dir_obj = Path(output_base_dir).expanduser().resolve()
@@ -493,7 +621,20 @@ def process_group_video_to_tracks(
 
     print("Initializing InsightFace detector + recognizer...")
     app = _build_face_app()
-    gallery = build_gallery(app, gallery_dir_obj) if gallery_dir_obj is not None else []
+    recognizer = None
+    if recognizer_checkpoint is not None:
+        recognizer = AttendanceRecognizer(
+            checkpoint_path=Path(recognizer_checkpoint).expanduser().resolve(),
+            device_name=recognizer_device,
+        )
+        print(f"Loaded recognition checkpoint: {recognizer_checkpoint} on device={recognizer.device}")
+    gallery = []
+    if gallery_dir_obj is not None:
+        gallery = (
+            build_gallery_with_recognizer(app, gallery_dir_obj, recognizer)
+            if recognizer is not None
+            else build_gallery(app, gallery_dir_obj)
+        )
 
     cap = cv2.VideoCapture(str(video_path_obj))
     if not cap.isOpened():
@@ -540,6 +681,11 @@ def process_group_video_to_tracks(
             detections.sort(key=lambda det: det.area, reverse=True)
             used_track_ids: set[int] = set()
             for detection in detections:
+                aligned_face = align_detection_face(detection)
+                recognition_embedding = None
+                recognition_norm = None
+                if recognizer is not None:
+                    recognition_embedding, recognition_norm = recognizer.extract(aligned_face)
                 matched_track = choose_track_for_detection(
                     detection=detection,
                     tracks=tracks,
@@ -565,7 +711,12 @@ def process_group_video_to_tracks(
                         f"bbox=({detection.width:.1f}x{detection.height:.1f})"
                     )
 
-                matched_track.update(detection)
+                matched_track.update(
+                    detection,
+                    aligned_face=aligned_face,
+                    recognition_embedding=recognition_embedding,
+                    recognition_norm=recognition_norm,
+                )
                 used_track_ids.add(matched_track.track_id)
                 total_detections_kept += 1
 
@@ -585,6 +736,7 @@ def process_group_video_to_tracks(
         gallery=gallery,
         auto_match_threshold=auto_match_threshold,
         review_margin=review_margin,
+        aggregation_window=aggregation_window,
     )
     write_outputs(
         video_output_dir=video_output_dir,
@@ -659,6 +811,22 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_REVIEW_MARGIN,
         help="Required gap between best and second-best gallery matches to auto accept a suggestion.",
     )
+    parser.add_argument(
+        "--recognizer-checkpoint",
+        default=None,
+        help="Optional recognition checkpoint. When provided, gallery matching uses this model instead of InsightFace embeddings.",
+    )
+    parser.add_argument(
+        "--recognizer-device",
+        default=None,
+        help="Optional torch device for the recognizer checkpoint, e.g. cpu, mps, cuda.",
+    )
+    parser.add_argument(
+        "--aggregation-window",
+        type=int,
+        default=8,
+        help="Number of most recent recognition frames to aggregate per track.",
+    )
     return parser.parse_args()
 
 
@@ -677,4 +845,7 @@ if __name__ == "__main__":
         gallery_dir=args.gallery_dir,
         auto_match_threshold=args.auto_match_threshold,
         review_margin=args.review_margin,
+        recognizer_checkpoint=args.recognizer_checkpoint,
+        recognizer_device=args.recognizer_device,
+        aggregation_window=args.aggregation_window,
     )

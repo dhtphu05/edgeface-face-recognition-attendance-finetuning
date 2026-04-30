@@ -1,0 +1,18 @@
+source_video: /Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/raw_videos/IMG_0030.MOV
+gallery_dir: /Users/mac/Desktop/Side_Project/Face-Recognition-Workspace/Attendance_Workspace/2_face_dataset_clean_core_split/train
+total_frames_read: 127
+sampled_frames: 43
+total_detections_kept: 45
+total_tracks_created: 4
+total_tracks_retired: 4
+final_tracks_kept: 3
+dropped_short_tracks: 1
+auto_matched_tracks: 0
+
+Kept tracks:
+- track_001: images=28 frames=1->82 suggested=102230190 score=0.7374 status=needs_review
+- track_002: images=11 frames=1->31 suggested=102250353 score=0.2708 status=needs_review
+- track_003: images=5 frames=43->58 suggested=102250233 score=0.2258 status=needs_review
+
+Dropped tracks:
+- track_004: status=dropped_short_track images=1

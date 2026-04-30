@@ -70,7 +70,10 @@ def main() -> None:
             linked_images = 0
 
             for class_name, class_dir in class_dir_map.items():
-                mixed_class_name = f"{source_name}__{class_name}"
+                if class_name.startswith(f"{source_name}__"):
+                    mixed_class_name = class_name
+                else:
+                    mixed_class_name = f"{source_name}__{class_name}"
                 output_class_dir = output_split_root / mixed_class_name
                 output_class_dir.mkdir(parents=True, exist_ok=True)
                 created_classes += 1
