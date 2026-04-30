@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataloaders.dataset import discover_class_dir_map, resolve_dataset_split_dirs
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".pgm"}
 
 
 def parse_args() -> argparse.Namespace:

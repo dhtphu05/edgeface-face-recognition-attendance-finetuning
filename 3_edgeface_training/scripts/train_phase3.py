@@ -589,6 +589,7 @@ def build_datasets(
 
     train_transform = transforms.Compose(
         [
+            transforms.Resize((112, 112)),
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
             DirectionalMotionBlur(probability=motion_blur_prob, kernel_size=motion_blur_kernel_size),
@@ -598,6 +599,7 @@ def build_datasets(
     )
     val_transform = transforms.Compose(
         [
+            transforms.Resize((112, 112)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]

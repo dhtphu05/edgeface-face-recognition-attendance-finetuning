@@ -35,6 +35,7 @@ weights/
 *.onnx
 
 # Dataset and raw media
+external_datasets/
 raw_videos/
 *.MOV
 *.mp4

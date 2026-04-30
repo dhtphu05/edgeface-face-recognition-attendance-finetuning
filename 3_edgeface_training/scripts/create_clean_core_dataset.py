@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".pgm"}
 
 
 def parse_args() -> argparse.Namespace:

@@ -10,7 +10,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, random_split
 
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".pgm"}
 
 
 @dataclass(frozen=True)
